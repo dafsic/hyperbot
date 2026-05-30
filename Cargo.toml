@@ -1,6 +1,40 @@
 [package]
 name = "hyperbot"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "Hyperliquid perpetual grid trading bot"
+license = "MIT"
+
+[lib]
+name = "hyperbot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyperbot"
+path = "src/main.rs"
 
 [dependencies]
+hyperliquid_rust_sdk = "0.6"
+ethers = "2.0"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "chrono",
+    "macros",
+    "migrate",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3"
