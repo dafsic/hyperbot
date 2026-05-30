@@ -99,8 +99,7 @@ pub trait Exchange: Send + Sync {
     async fn mid_price(&self, coin: &str) -> anyhow::Result<f64>;
 
     /// Sets leverage for `coin`.
-    async fn update_leverage(&self, coin: &str, leverage: u32, cross: bool)
-        -> anyhow::Result<()>;
+    async fn update_leverage(&self, coin: &str, leverage: u32, cross: bool) -> anyhow::Result<()>;
 
     /// Places a single limit order.
     async fn place_order(&self, req: &PlaceOrder) -> anyhow::Result<PlacedOrder>;

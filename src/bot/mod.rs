@@ -73,7 +73,10 @@ impl Bot {
         let initial = self.strategy.initial_orders(mid, &active_levels);
         for order in initial {
             if let Err(e) = self.place_and_persist(&order).await {
-                error!("failed to place initial order at level {}: {e}", order.level);
+                error!(
+                    "failed to place initial order at level {}: {e}",
+                    order.level
+                );
             }
         }
         Ok(())
@@ -181,9 +184,7 @@ impl Bot {
         self.store.set_status(order.id, OrderStatus::Filled).await?;
         info!(level = order.level, side = ?order.side, "order filled");
 
-        let counters = self
-            .strategy
-            .on_fill(order.level as usize, order.side);
+        let counters = self.strategy.on_fill(order.level as usize, order.side);
         for c in counters {
             if self.has_open_at_level(c.level).await? {
                 continue; // avoid duplicating an already-live level

@@ -84,12 +84,7 @@ impl Exchange for HyperliquidExchange {
         raw.parse::<f64>().context("parsing mid price")
     }
 
-    async fn update_leverage(
-        &self,
-        coin: &str,
-        leverage: u32,
-        cross: bool,
-    ) -> anyhow::Result<()> {
+    async fn update_leverage(&self, coin: &str, leverage: u32, cross: bool) -> anyhow::Result<()> {
         self.exchange
             .update_leverage(leverage, coin, cross, None)
             .await
