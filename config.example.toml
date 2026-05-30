@@ -1,0 +1,44 @@
+# Hyperbot example configuration.
+#
+# Copy to `config.toml` and adjust. Secrets (private key, database URL) are
+# injected from the environment and should be left empty here:
+#   HYPERBOT_PRIVATE_KEY, DATABASE_URL
+# See `.env.example`.
+
+[exchange]
+# "mainnet" or "testnet". Start on testnet!
+network = "testnet"
+# Leave empty: provided via HYPERBOT_PRIVATE_KEY.
+private_key = ""
+# Leverage applied to the coin before trading.
+leverage = 2
+# true = cross margin, false = isolated margin.
+cross_margin = false
+
+[grid]
+# Perp coin symbol. The XMR/USDC perpetual is referenced as "XMR".
+coin = "XMR"
+# Price range of the grid.
+lower_price = 120.0
+upper_price = 180.0
+# Number of intervals (grid has grid_count + 1 lines).
+grid_count = 30
+# "arithmetic" (等差) or "geometric" (等比).
+spacing = "arithmetic"
+# Contracts placed per grid line.
+order_size = 0.1
+# "short_only" (单边只做空), "long_only" or "neutral".
+mode = "short_only"
+
+[risk]
+# Max absolute position (contracts); 0 disables the check.
+max_position = 5.0
+# Max tolerated unrealised loss in USDC; 0 disables the check.
+max_loss_usd = 300.0
+# Hard leverage cap; configured leverage must not exceed it.
+max_leverage = 10
+
+[database]
+# Leave empty: provided via DATABASE_URL.
+url = ""
+max_connections = 5

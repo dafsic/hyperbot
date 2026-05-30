@@ -157,8 +157,7 @@ impl Config {
         let mut cfg: Config = if path.exists() {
             let raw = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-            toml::from_str(&raw)
-                .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
+            toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
         } else {
             return Err(anyhow::anyhow!(
                 "config file {} not found; copy config.example.toml",

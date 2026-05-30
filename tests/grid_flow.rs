@@ -97,8 +97,7 @@ async fn short_grid_seeds_sells_and_takes_profit() {
 
     let open = store.open_orders("XMR").await.unwrap();
     assert!(
-        open.iter()
-            .any(|o| o.level == 6 && o.side == Side::Sell),
+        open.iter().any(|o| o.level == 6 && o.side == Side::Sell),
         "sell re-seeded at level 6"
     );
 }
