@@ -23,8 +23,10 @@ pub struct Bot {
     cancel_on_exit: bool,
 }
 
-/// Safety cap on how many follow-up orders a single fill may cascade into,
-/// guarding against an unexpected configuration looping indefinitely.
+/// Safety cap on how many follow-up orders a single submission may cascade
+/// into, guarding against an unexpected configuration looping indefinitely.
+/// A grid only ever cascades a couple of hops per fill, so 64 is far above any
+/// legitimate chain while still bounding a runaway loop.
 const MAX_FOLLOWUPS: usize = 64;
 
 impl Bot {
