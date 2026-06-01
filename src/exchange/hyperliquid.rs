@@ -1,17 +1,19 @@
 //! Hyperliquid implementation of the [`Exchange`] trait.
 
-use std::str::FromStr;
+use std::collections::HashMap;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use ethers::signers::{LocalWallet, Signer};
-use ethers::types::H160;
-use hyperliquid_rust_sdk::{
-    BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
-    ExchangeDataStatus, ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
+use futures::StreamExt;
+use hypersdk::hypercore::types::{
+    BatchCancel, BatchOrder, Cancel, Incoming, OrderGrouping, OrderRequest, OrderResponseStatus,
+    OrderTypePlacement, Side as HlSide, Subscription, TimeInForce, UserEvent,
 };
+use hypersdk::hypercore::{self, HttpClient, PrivateKeySigner, WebSocket};
+use hypersdk::{Address, Decimal};
+use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::{Exchange, ExchangeEvent, FillEvent, OpenOrder, PlaceOrder, PlacedOrder, Position};
 use crate::config::Network;
@@ -19,54 +21,95 @@ use crate::grid::Side;
 
 /// Live Hyperliquid exchange client.
 pub struct HyperliquidExchange {
-    info: InfoClient,
-    exchange: ExchangeClient,
-    user_address: H160,
-    base_url: BaseUrl,
+    client: HttpClient,
+    signer: PrivateKeySigner,
+    user_address: Address,
+    network: Network,
+    /// Maps a coin symbol (e.g. `"XMR"`) to its numeric perp asset index, which
+    /// the signed order/cancel/leverage actions require.
+    coin_to_asset: HashMap<String, usize>,
 }
 
-fn base_url(network: Network) -> BaseUrl {
+/// Builds an HTTP client for `network`.
+fn http_client(network: Network) -> HttpClient {
     match network {
-        Network::Mainnet => BaseUrl::Mainnet,
-        Network::Testnet => BaseUrl::Testnet,
+        Network::Mainnet => hypercore::mainnet(),
+        Network::Testnet => hypercore::testnet(),
     }
 }
 
-/// Hyperliquid encodes bids (buys) as side `"B"` and asks (sells) as `"A"`.
-fn parse_side(side: &str) -> Side {
-    if side.eq_ignore_ascii_case("B") {
-        Side::Buy
-    } else {
-        Side::Sell
+/// Builds a websocket connection for `network`.
+fn websocket(network: Network) -> WebSocket {
+    match network {
+        Network::Mainnet => hypercore::mainnet_ws(),
+        Network::Testnet => hypercore::testnet_ws(),
     }
+}
+
+/// Hyperliquid encodes bids as buys and asks as sells.
+fn map_side(side: HlSide) -> Side {
+    match side {
+        HlSide::Bid => Side::Buy,
+        HlSide::Ask => Side::Sell,
+    }
+}
+
+/// Converts a [`Decimal`] to `f64`, defaulting to `0.0` on the (practically
+/// impossible) conversion failure so a single bad field can't abort a stream.
+fn to_f64(value: Decimal) -> f64 {
+    value.to_f64().unwrap_or(0.0)
+}
+
+/// Converts an `f64` price/size to the [`Decimal`] the exchange expects.
+fn to_decimal(value: f64) -> anyhow::Result<Decimal> {
+    Decimal::try_from(value).map_err(|e| anyhow!("invalid decimal {value}: {e}"))
+}
+
+/// A fresh, monotonically-increasing nonce based on the wall clock, as required
+/// by the Hyperliquid signing scheme.
+fn nonce() -> u64 {
+    chrono::Utc::now().timestamp_millis() as u64
 }
 
 impl HyperliquidExchange {
     /// Connects to Hyperliquid using `private_key` on `network`.
     pub async fn new(private_key: &str, network: Network) -> anyhow::Result<Self> {
-        let wallet = LocalWallet::from_str(private_key.trim_start_matches("0x"))
+        let signer: PrivateKeySigner = private_key
+            .trim()
+            .trim_start_matches("0x")
+            .parse()
             .context("invalid private key")?;
-        let user_address = wallet.address();
-        let url = base_url(network);
+        let user_address = signer.address();
+        let client = http_client(network);
 
-        let info = InfoClient::new(None, Some(url))
+        // The perp metadata gives us the coin -> asset-index mapping needed for
+        // every signed action.
+        let perps = client
+            .perps()
             .await
-            .map_err(|e| anyhow!("creating info client: {e}"))?;
-        let exchange = ExchangeClient::new(None, wallet, Some(url), None, None)
-            .await
-            .map_err(|e| anyhow!("creating exchange client: {e}"))?;
+            .map_err(|e| anyhow!("fetching perp metadata: {e}"))?;
+        let coin_to_asset = perps.into_iter().map(|m| (m.name, m.index)).collect();
 
         Ok(Self {
-            info,
-            exchange,
+            client,
+            signer,
             user_address,
-            base_url: url,
+            network,
+            coin_to_asset,
         })
     }
 
     /// The address derived from the configured wallet.
-    pub fn address(&self) -> H160 {
+    pub fn address(&self) -> Address {
         self.user_address
+    }
+
+    /// Resolves a coin symbol to its numeric perp asset index.
+    fn asset_index(&self, coin: &str) -> anyhow::Result<usize> {
+        self.coin_to_asset
+            .get(coin)
+            .copied()
+            .ok_or_else(|| anyhow!("unknown coin {coin}"))
     }
 }
 
@@ -74,66 +117,77 @@ impl HyperliquidExchange {
 impl Exchange for HyperliquidExchange {
     async fn mid_price(&self, coin: &str) -> anyhow::Result<f64> {
         let mids = self
-            .info
-            .all_mids()
+            .client
+            .all_mids(None)
             .await
             .map_err(|e| anyhow!("all_mids: {e}"))?;
-        let raw = mids
+        let px = mids
             .get(coin)
             .ok_or_else(|| anyhow!("no mid price for {coin}"))?;
-        raw.parse::<f64>().context("parsing mid price")
+        Ok(to_f64(*px))
     }
 
     async fn update_leverage(&self, coin: &str, leverage: u32, cross: bool) -> anyhow::Result<()> {
-        self.exchange
-            .update_leverage(leverage, coin, cross, None)
+        let asset = self.asset_index(coin)?;
+        self.client
+            .update_leverage(&self.signer, asset, cross, leverage, nonce(), None, None)
             .await
             .map_err(|e| anyhow!("update_leverage: {e}"))?;
         Ok(())
     }
 
     async fn place_order(&self, req: &PlaceOrder) -> anyhow::Result<PlacedOrder> {
-        let order = ClientOrderRequest {
-            asset: req.coin.clone(),
+        let asset = self.asset_index(&req.coin)?;
+        let order = OrderRequest {
+            asset,
             is_buy: req.side.is_buy(),
+            limit_px: to_decimal(req.price)?,
+            sz: to_decimal(req.size)?,
             reduce_only: req.reduce_only,
-            limit_px: req.price,
-            sz: req.size,
-            cloid: None,
-            order_type: ClientOrder::Limit(ClientLimit {
-                tif: "Gtc".to_string(),
-            }),
+            order_type: OrderTypePlacement::Limit {
+                tif: TimeInForce::Gtc,
+            },
+            cloid: Default::default(),
         };
-        let resp = self
-            .exchange
-            .order(order, None)
+        let batch = BatchOrder {
+            orders: vec![order],
+            grouping: OrderGrouping::Na,
+            builder: None,
+        };
+        let statuses = self
+            .client
+            .place(&self.signer, batch, nonce(), None, None)
             .await
             .map_err(|e| anyhow!("placing order: {e}"))?;
-        parse_place_response(resp)
+        let status = statuses
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("order response had no statuses"))?;
+        parse_place_response(status)
     }
 
     async fn cancel_order(&self, coin: &str, oid: u64) -> anyhow::Result<()> {
-        let resp = self
-            .exchange
-            .cancel(
-                ClientCancelRequest {
-                    asset: coin.to_string(),
-                    oid,
-                },
-                None,
-            )
+        let asset = self.asset_index(coin)?;
+        let batch = BatchCancel {
+            cancels: vec![Cancel { asset, oid }],
+        };
+        let statuses = self
+            .client
+            .cancel(&self.signer, batch, nonce(), None, None)
             .await
             .map_err(|e| anyhow!("cancelling order: {e}"))?;
-        match resp {
-            ExchangeResponseStatus::Ok(_) => Ok(()),
-            ExchangeResponseStatus::Err(e) => Err(anyhow!("cancel rejected: {e}")),
+        for status in statuses {
+            if let OrderResponseStatus::Error(e) = status {
+                return Err(anyhow!("cancel rejected: {e}"));
+            }
         }
+        Ok(())
     }
 
     async fn open_orders(&self, coin: &str) -> anyhow::Result<Vec<OpenOrder>> {
         let orders = self
-            .info
-            .open_orders(self.user_address)
+            .client
+            .open_orders(self.user_address, None)
             .await
             .map_err(|e| anyhow!("open_orders: {e}"))?;
         let mut out = Vec::new();
@@ -144,9 +198,9 @@ impl Exchange for HyperliquidExchange {
             out.push(OpenOrder {
                 oid: o.oid,
                 coin: o.coin,
-                side: parse_side(&o.side),
-                price: o.limit_px.parse().unwrap_or(0.0),
-                size: o.sz.parse().unwrap_or(0.0),
+                side: map_side(o.side),
+                price: to_f64(o.limit_px),
+                size: to_f64(o.sz),
             });
         }
         Ok(out)
@@ -154,24 +208,18 @@ impl Exchange for HyperliquidExchange {
 
     async fn position(&self, coin: &str) -> anyhow::Result<Option<Position>> {
         let state = self
-            .info
-            .user_state(self.user_address)
+            .client
+            .clearinghouse_state(self.user_address, None)
             .await
-            .map_err(|e| anyhow!("user_state: {e}"))?;
+            .map_err(|e| anyhow!("clearinghouse_state: {e}"))?;
         for ap in state.asset_positions {
-            if ap.position.coin == coin {
-                let size = ap.position.szi.parse::<f64>().unwrap_or(0.0);
-                let entry_price = ap
-                    .position
-                    .entry_px
-                    .as_deref()
-                    .and_then(|s| s.parse::<f64>().ok());
-                let unrealized_pnl = ap.position.unrealized_pnl.parse::<f64>().unwrap_or(0.0);
+            let position = ap.position;
+            if position.coin == coin {
                 return Ok(Some(Position {
                     coin: coin.to_string(),
-                    size,
-                    entry_price,
-                    unrealized_pnl,
+                    size: to_f64(position.szi),
+                    entry_price: position.entry_px.map(to_f64),
+                    unrealized_pnl: to_f64(position.unrealized_pnl),
                 }));
             }
         }
@@ -179,64 +227,53 @@ impl Exchange for HyperliquidExchange {
     }
 
     async fn subscribe(&self, coin: &str) -> anyhow::Result<UnboundedReceiver<ExchangeEvent>> {
-        // A dedicated InfoClient owns the websocket subscription so that the
-        // shared `self.info` used for REST queries is never mutably borrowed.
-        let mut ws = InfoClient::with_reconnect(None, Some(self.base_url))
-            .await
-            .map_err(|e| anyhow!("creating ws client: {e}"))?;
-
-        let (raw_tx, mut raw_rx) = unbounded_channel();
-        ws.subscribe(Subscription::AllMids, raw_tx.clone())
-            .await
-            .map_err(|e| anyhow!("subscribe AllMids: {e}"))?;
-        ws.subscribe(
-            Subscription::UserEvents {
-                user: self.user_address,
-            },
-            raw_tx,
-        )
-        .await
-        .map_err(|e| anyhow!("subscribe UserEvents: {e}"))?;
+        // A dedicated websocket connection owns the subscription so the shared
+        // `self.client` used for REST queries is untouched.
+        let ws = websocket(self.network);
+        ws.subscribe(Subscription::AllMids { dex: None });
+        ws.subscribe(Subscription::UserEvents {
+            user: self.user_address,
+        });
 
         let (tx, rx) = unbounded_channel();
         let coin = coin.to_string();
         tokio::spawn(async move {
-            // Keep the websocket client alive for the lifetime of the task.
-            let _ws = ws;
-            while let Some(message) = raw_rx.recv().await {
+            // Keep the websocket connection alive for the lifetime of the task.
+            let mut ws = ws;
+            while let Some(event) = ws.next().await {
+                let message = match event {
+                    hypercore::ws::Event::Message(message) => message,
+                    hypercore::ws::Event::Connected => continue,
+                    hypercore::ws::Event::Disconnected => {
+                        warn!("hyperliquid websocket disconnected; reconnecting");
+                        continue;
+                    }
+                };
                 match message {
-                    Message::AllMids(all_mids) => {
-                        if let Some(mid) = all_mids.data.mids.get(&coin) {
-                            if let Ok(px) = mid.parse::<f64>() {
-                                if tx.send(ExchangeEvent::Mid(px)).is_err() {
-                                    break;
-                                }
+                    Incoming::AllMids { mids, .. } => {
+                        if let Some(px) = mids.get(&coin) {
+                            if tx.send(ExchangeEvent::Mid(to_f64(*px))).is_err() {
+                                break;
                             }
                         }
                     }
-                    Message::User(user) => {
-                        if let UserData::Fills(fills) = user.data {
-                            for fill in fills {
-                                if fill.coin != coin {
-                                    continue;
-                                }
-                                let event = FillEvent {
-                                    oid: fill.oid,
-                                    coin: fill.coin.clone(),
-                                    side: parse_side(&fill.side),
-                                    price: fill.px.parse().unwrap_or(0.0),
-                                    size: fill.sz.parse().unwrap_or(0.0),
-                                };
-                                if tx.send(ExchangeEvent::Fill(event)).is_err() {
-                                    return;
-                                }
+                    Incoming::UserEvents(UserEvent::Fills { fills }) => {
+                        for fill in fills {
+                            if fill.coin != coin {
+                                continue;
+                            }
+                            let event = FillEvent {
+                                oid: fill.oid,
+                                coin: fill.coin.clone(),
+                                side: map_side(fill.side),
+                                price: to_f64(fill.px),
+                                size: to_f64(fill.sz),
+                            };
+                            if tx.send(ExchangeEvent::Fill(event)).is_err() {
+                                return;
                             }
                         }
                     }
-                    Message::NoData => {
-                        warn!("websocket returned NoData (disconnected)");
-                    }
-                    Message::HyperliquidError(e) => error!("hyperliquid ws error: {e}"),
                     _ => {}
                 }
             }
@@ -246,32 +283,16 @@ impl Exchange for HyperliquidExchange {
     }
 }
 
-/// Interprets an order placement response, returning the resting/filled oid.
-fn parse_place_response(resp: ExchangeResponseStatus) -> anyhow::Result<PlacedOrder> {
-    match resp {
-        ExchangeResponseStatus::Ok(resp) => {
-            let data = resp
-                .data
-                .ok_or_else(|| anyhow!("order response missing data"))?;
-            let status = data
-                .statuses
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("order response had no statuses"))?;
-            match status {
-                ExchangeDataStatus::Resting(o) => Ok(PlacedOrder {
-                    oid: o.oid,
-                    resting: true,
-                }),
-                ExchangeDataStatus::Filled(o) => Ok(PlacedOrder {
-                    oid: o.oid,
-                    resting: false,
-                }),
-                ExchangeDataStatus::Error(e) => Err(anyhow!("order rejected: {e}")),
-                other => Err(anyhow!("unexpected order status: {other:?}")),
-            }
-        }
-        ExchangeResponseStatus::Err(e) => Err(anyhow!("order request failed: {e}")),
+/// Interprets an order placement status, returning the resting/filled oid.
+fn parse_place_response(status: OrderResponseStatus) -> anyhow::Result<PlacedOrder> {
+    match status {
+        OrderResponseStatus::Resting { oid, .. } => Ok(PlacedOrder { oid, resting: true }),
+        OrderResponseStatus::Filled { oid, .. } => Ok(PlacedOrder {
+            oid,
+            resting: false,
+        }),
+        OrderResponseStatus::Error(e) => Err(anyhow!("order rejected: {e}")),
+        other => Err(anyhow!("unexpected order status: {other:?}")),
     }
 }
 
@@ -280,16 +301,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_hyperliquid_sides() {
-        assert_eq!(parse_side("B"), Side::Buy);
-        assert_eq!(parse_side("b"), Side::Buy);
-        assert_eq!(parse_side("A"), Side::Sell);
+    fn maps_hyperliquid_sides() {
+        assert_eq!(map_side(HlSide::Bid), Side::Buy);
+        assert_eq!(map_side(HlSide::Ask), Side::Sell);
     }
 
     #[test]
-    fn maps_networks_to_base_urls() {
-        // Smoke test that both variants are handled.
-        let _ = base_url(Network::Mainnet);
-        let _ = base_url(Network::Testnet);
+    fn parses_resting_and_filled_responses() {
+        let resting = parse_place_response(OrderResponseStatus::Resting {
+            oid: 7,
+            cloid: None,
+        })
+        .unwrap();
+        assert_eq!(resting, PlacedOrder { oid: 7, resting: true });
+
+        let filled = parse_place_response(OrderResponseStatus::Filled {
+            total_sz: Decimal::ZERO,
+            avg_px: Decimal::ZERO,
+            oid: 9,
+        })
+        .unwrap();
+        assert_eq!(
+            filled,
+            PlacedOrder {
+                oid: 9,
+                resting: false
+            }
+        );
+
+        assert!(parse_place_response(OrderResponseStatus::Error("nope".into())).is_err());
+    }
+
+    #[test]
+    fn converts_between_decimal_and_f64() {
+        let d = to_decimal(123.5).unwrap();
+        assert_eq!(to_f64(d), 123.5);
     }
 }
