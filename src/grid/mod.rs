@@ -140,16 +140,29 @@ impl GridStrategy {
     /// Computes the set of orders to place when (re)starting the grid given the
     /// current `mid` price and the set of levels that already have a live order.
     ///
-    /// For a short-only grid this seeds a sell (open-short) leg on **every** grid
-    /// line except the lowest one (which only ever hosts a take-profit buy).
-    /// Lines above the mid price rest on the book; lines at or below the mid are
-    /// crossing orders that fill immediately, opening the short. The caller is
-    /// responsible for detecting the immediate fills (see [`GridStrategy::on_fill`])
-    /// and seeding the matching reduce-only buy one line below. Buy legs are only
-    /// ever created in response to a sell fill, so the net position can never
-    /// become positive.
+    /// All three modes share the same idea (思路): seed the opening leg on every
+    /// relevant grid line and let the caller decide, from the mid, whether each
+    /// order rests on the book or crosses and fills immediately. Immediate fills
+    /// open the position right away; the caller then seeds the matching
+    /// take-profit counter leg via [`GridStrategy::on_fill`].
+    ///
+    /// * **Short-only**: seeds a sell (open-short) on every line but the lowest
+    ///   (which only ever hosts a take-profit buy). Lines at or below the mid
+    ///   cross and open shorts immediately; lines above rest. Buy legs are only
+    ///   ever created in response to a sell fill, so the net position can never
+    ///   become positive.
+    /// * **Long-only** (mirror of short-only): seeds a buy (open-long) on every
+    ///   line but the highest (which only ever hosts a take-profit sell). Lines
+    ///   at or above the mid cross and open longs immediately; lines below rest.
+    ///   Sell legs are only ever created in response to a buy fill, so the net
+    ///   position can never become negative.
+    /// * **Neutral**: seeds buys below the mid (open long as price drops) and
+    ///   sells above the mid (open short as price rises). Neither side crosses at
+    ///   startup, so the grid opens no position until the market moves into a
+    ///   resting order; the position may then swing either way around the mid.
     pub fn initial_orders(&self, mid: f64, active_levels: &[usize]) -> Vec<DesiredOrder> {
         let size = self.params.order_size;
+        let last = self.last_level();
         let mut out = Vec::new();
         for (level, &price) in self.levels.iter().enumerate() {
             if active_levels.contains(&level) {
@@ -170,7 +183,11 @@ impl GridStrategy {
                     }
                 }
                 GridMode::LongOnly => {
-                    if price < mid {
+                    // Seed a buy on every line but the highest. Whether it rests
+                    // or fills immediately (opening a long) is decided by the
+                    // caller from the mid: buys at or above the mid cross, buys
+                    // below rest.
+                    if level < last {
                         out.push(DesiredOrder {
                             level,
                             price,
@@ -460,5 +477,150 @@ mod tests {
         assert!(s.on_fill(0, Side::Sell).is_empty());
         // buy filled at top level cannot seed a sell above it.
         assert!(s.on_fill(s.last_level(), Side::Buy).is_empty());
+    }
+
+    fn long_params() -> GridParams {
+        GridParams {
+            mode: GridMode::LongOnly,
+            ..short_params()
+        }
+    }
+
+    #[test]
+    fn long_only_initial_orders_seed_a_buy_on_every_line_but_the_highest() {
+        let s = GridStrategy::new(long_params()).unwrap();
+        // mid in the middle of the grid (150). Levels are 100,110,...,200.
+        let orders = s.initial_orders(150.0, &[]);
+        assert!(!orders.is_empty());
+        for o in &orders {
+            assert_eq!(o.side, Side::Buy);
+            assert!(!o.reduce_only);
+        }
+        // A buy is seeded on every line except the highest (level 10 == price
+        // 200): levels 0..=9 => 10 orders.
+        assert_eq!(orders.len(), 10);
+        assert!(orders.iter().all(|o| o.level != 10));
+        // Lines at or above the mid (150..=190) are crossing orders that fill
+        // immediately, opening the long. Here level 5 (price 150) up to level 9.
+        assert!(orders.iter().any(|o| o.level == 5 && o.price >= 150.0));
+        assert!(orders.iter().any(|o| o.level == 9 && o.price >= 150.0));
+    }
+
+    #[test]
+    fn long_only_skips_already_active_levels() {
+        let s = GridStrategy::new(long_params()).unwrap();
+        let all = s.initial_orders(150.0, &[]);
+        let with_active = s.initial_orders(150.0, &[0]); // level 0 == price 100
+        assert_eq!(with_active.len(), all.len() - 1);
+        assert!(with_active.iter().all(|o| o.level != 0));
+    }
+
+    #[test]
+    fn long_only_seeds_a_mid_range_grid() {
+        // Mirror of the short-only mid-range scenario: mid = 100, region 80..120.
+        let s = GridStrategy::new(GridParams {
+            lower_price: 80.0,
+            upper_price: 120.0,
+            grid_count: 4,
+            mode: GridMode::LongOnly,
+            ..short_params()
+        })
+        .unwrap();
+        // Levels: 0=80, 1=90, 2=100, 3=110, 4=120.
+        let orders = s.initial_orders(100.0, &[]);
+        // Buys on every line but the highest (120): 80, 90, 100, 110 => 4 orders.
+        assert_eq!(orders.len(), 4);
+        assert!(orders.iter().all(|o| o.side == Side::Buy && !o.reduce_only));
+        // Lines at or above mid (100, 110) are crossing orders -> immediate long.
+        assert!(orders.iter().any(|o| o.level == 2 && o.price >= 100.0));
+        assert!(orders.iter().any(|o| o.level == 3 && o.price >= 100.0));
+        // Lines below mid (80, 90) rest on the book.
+        assert!(orders.iter().any(|o| o.level == 0 && o.price < 100.0));
+        assert!(orders.iter().any(|o| o.level == 1 && o.price < 100.0));
+        // The highest line (120) only ever hosts a take-profit sell.
+        assert!(orders.iter().all(|o| o.level != 4));
+    }
+
+    #[test]
+    fn long_only_buy_fill_seeds_reduce_only_sell_above() {
+        let s = GridStrategy::new(long_params()).unwrap();
+        let counter = s.on_fill(5, Side::Buy);
+        assert_eq!(counter.len(), 1);
+        assert_eq!(counter[0].side, Side::Sell);
+        assert!(counter[0].reduce_only);
+        assert_eq!(counter[0].level, 6);
+        assert_relative_eq!(counter[0].price, 160.0);
+    }
+
+    #[test]
+    fn long_only_sell_fill_seeds_buy_below() {
+        let s = GridStrategy::new(long_params()).unwrap();
+        let counter = s.on_fill(6, Side::Sell);
+        assert_eq!(counter.len(), 1);
+        assert_eq!(counter[0].side, Side::Buy);
+        assert!(!counter[0].reduce_only);
+        assert_eq!(counter[0].level, 5);
+    }
+
+    #[test]
+    fn long_only_never_sells_above_top_or_buys_below_bottom() {
+        let s = GridStrategy::new(long_params()).unwrap();
+        // buy filled at top level cannot seed a take-profit sell above it.
+        assert!(s.on_fill(s.last_level(), Side::Buy).is_empty());
+        // sell filled at bottom level cannot seed a buy below it.
+        assert!(s.on_fill(0, Side::Sell).is_empty());
+    }
+
+    fn neutral_params() -> GridParams {
+        GridParams {
+            mode: GridMode::Neutral,
+            ..short_params()
+        }
+    }
+
+    #[test]
+    fn neutral_initial_orders_buy_below_and_sell_above_mid() {
+        let s = GridStrategy::new(neutral_params()).unwrap();
+        // Levels 100,110,...,200; mid = 150 sits exactly on level 5.
+        let orders = s.initial_orders(150.0, &[]);
+        // Buys below mid: 100..140 (levels 0..=4). Sells above mid: 160..200
+        // (levels 6..=10). The level exactly at the mid (150) is left untouched.
+        assert!(orders
+            .iter()
+            .all(|o| (o.side == Side::Buy && o.price < 150.0)
+                || (o.side == Side::Sell && o.price > 150.0)));
+        assert!(orders.iter().all(|o| !o.reduce_only));
+        assert!(orders.iter().any(|o| o.level == 4 && o.side == Side::Buy));
+        assert!(orders.iter().any(|o| o.level == 6 && o.side == Side::Sell));
+        // Nothing is seeded exactly at the mid line.
+        assert!(orders.iter().all(|o| o.level != 5));
+        // Five buys (levels 0..=4) and five sells (levels 6..=10).
+        assert_eq!(orders.len(), 10);
+    }
+
+    #[test]
+    fn neutral_fills_oscillate_without_reduce_only() {
+        let s = GridStrategy::new(neutral_params()).unwrap();
+        // A buy fill seeds a (non-reduce-only) sell one line above.
+        let after_buy = s.on_fill(4, Side::Buy);
+        assert_eq!(after_buy.len(), 1);
+        assert_eq!(after_buy[0].side, Side::Sell);
+        assert_eq!(after_buy[0].level, 5);
+        assert!(!after_buy[0].reduce_only);
+        // A sell fill seeds a (non-reduce-only) buy one line below.
+        let after_sell = s.on_fill(6, Side::Sell);
+        assert_eq!(after_sell.len(), 1);
+        assert_eq!(after_sell[0].side, Side::Buy);
+        assert_eq!(after_sell[0].level, 5);
+        assert!(!after_sell[0].reduce_only);
+    }
+
+    #[test]
+    fn neutral_respects_grid_boundaries() {
+        let s = GridStrategy::new(neutral_params()).unwrap();
+        // buy filled at the top cannot seed a sell above it.
+        assert!(s.on_fill(s.last_level(), Side::Buy).is_empty());
+        // sell filled at the bottom cannot seed a buy below it.
+        assert!(s.on_fill(0, Side::Sell).is_empty());
     }
 }
