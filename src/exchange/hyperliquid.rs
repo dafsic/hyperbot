@@ -229,7 +229,7 @@ impl Exchange for HyperliquidExchange {
     async fn subscribe(&self, coin: &str) -> anyhow::Result<UnboundedReceiver<ExchangeEvent>> {
         // A dedicated websocket connection owns the subscription so the shared
         // `self.client` used for REST queries is untouched.
-        let ws = websocket(self.network);
+        let mut ws = websocket(self.network);
         ws.subscribe(Subscription::AllMids { dex: None });
         ws.subscribe(Subscription::UserEvents {
             user: self.user_address,
@@ -238,8 +238,7 @@ impl Exchange for HyperliquidExchange {
         let (tx, rx) = unbounded_channel();
         let coin = coin.to_string();
         tokio::spawn(async move {
-            // Keep the websocket connection alive for the lifetime of the task.
-            let mut ws = ws;
+            // `ws` is moved in to keep the connection alive for the task.
             while let Some(event) = ws.next().await {
                 let message = match event {
                     hypercore::ws::Event::Message(message) => message,
