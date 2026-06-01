@@ -221,10 +221,13 @@ impl Bot {
 
     /// Decides whether a desired order would duplicate work already on the book.
     ///
-    /// Skips an order whose (level, side) already rests, and skips an
-    /// open-short sell whose short is already open — represented by a resting
-    /// reduce-only buy one line below — so a restart does not re-open a position
-    /// the bot is already holding.
+    /// Skips an order whose (level, side) already rests. It also avoids
+    /// re-opening a position the bot already holds across a restart:
+    ///
+    /// * An opening **sell** that crosses (short-only) is skipped when its
+    ///   matching take-profit reduce-only buy one line below is already resting.
+    /// * An opening **buy** that crosses (long-only) is skipped when its matching
+    ///   take-profit reduce-only sell one line above is already resting.
     async fn should_skip(&self, order: &DesiredOrder, mid: f64) -> anyhow::Result<bool> {
         let open = self.store.open_orders(self.coin()).await?;
         if open
@@ -242,6 +245,20 @@ impl Bot {
             if open
                 .iter()
                 .any(|o| o.level as usize == below && o.side == Side::Buy && o.reduce_only)
+            {
+                return Ok(true);
+            }
+        }
+        // An opening buy that crosses would open a long. If the matching
+        // take-profit sell one line above is already resting, the long is
+        // already open; don't open another.
+        let last = self.strategy.levels().len().saturating_sub(1);
+        if order.side == Side::Buy && !order.reduce_only && order.price >= mid && order.level < last
+        {
+            let above = order.level + 1;
+            if open
+                .iter()
+                .any(|o| o.level as usize == above && o.side == Side::Sell && o.reduce_only)
             {
                 return Ok(true);
             }
