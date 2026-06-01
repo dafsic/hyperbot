@@ -52,6 +52,11 @@ pub struct ExchangeConfig {
     /// Whether to use cross (`true`) or isolated (`false`) margin.
     #[serde(default)]
     pub cross_margin: bool,
+    /// Whether to cancel all resting orders when the bot shuts down. Defaults to
+    /// `false` so resting grid orders are preserved across restarts and picked
+    /// up again on the next startup.
+    #[serde(default)]
+    pub cancel_on_exit: bool,
 }
 
 fn default_leverage() -> u32 {

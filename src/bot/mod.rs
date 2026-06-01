@@ -1,12 +1,13 @@
 //! Bot orchestration: wires the exchange, persistence layer, grid strategy and
 //! risk manager together into a long-running event loop.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
 use crate::exchange::{Exchange, ExchangeEvent, FillEvent, PlaceOrder};
-use crate::grid::{DesiredOrder, GridStrategy};
+use crate::grid::{DesiredOrder, GridStrategy, Side};
 use crate::risk::{RiskManager, RiskVerdict};
 use crate::store::{NewGridOrder, OrderStatus, Store};
 
@@ -21,6 +22,10 @@ pub struct Bot {
     /// Whether to cancel all resting orders on graceful shutdown.
     cancel_on_exit: bool,
 }
+
+/// Safety cap on how many follow-up orders a single fill may cascade into,
+/// guarding against an unexpected configuration looping indefinitely.
+const MAX_FOLLOWUPS: usize = 64;
 
 impl Bot {
     /// Creates a new bot.
@@ -39,7 +44,7 @@ impl Bot {
             risk,
             leverage,
             cross_margin,
-            cancel_on_exit: true,
+            cancel_on_exit: false,
         }
     }
 
@@ -72,11 +77,8 @@ impl Bot {
 
         let initial = self.strategy.initial_orders(mid, &active_levels);
         for order in initial {
-            if let Err(e) = self.place_and_persist(&order).await {
-                error!(
-                    "failed to place initial order at level {}: {e}",
-                    order.level
-                );
+            if let Err(e) = self.submit_order(order.clone(), mid).await {
+                error!("failed to seed initial order at level {}: {e}", order.level);
             }
         }
         Ok(())
@@ -86,7 +88,11 @@ impl Bot {
     ///
     /// Returns the set of grid levels that already have a live order so the
     /// caller can avoid double-placing them. Exchange orders that the bot does
-    /// not track are cancelled.
+    /// not track are cancelled. Tracked orders that vanished from the book while
+    /// the bot was offline are marked filled, and the counter order(s) the
+    /// strategy dictates for those fills are seeded (this is how a short opened
+    /// while offline gets its take-profit buy, or a take-profit that filled
+    /// offline gets its sell re-placed).
     pub async fn reconcile(&self) -> anyhow::Result<Vec<usize>> {
         let coin = self.coin().to_string();
         let db_orders = self.store.open_orders(&coin).await?;
@@ -106,31 +112,154 @@ impl Bot {
         }
 
         // Detect tracked orders that have vanished from the book (filled while
-        // we were offline) and mark them so.
+        // we were offline) and mark them so, remembering the fills we need to
+        // replay through the strategy once everything is reconciled.
         let live: std::collections::HashSet<i64> =
             exchange_orders.iter().map(|o| o.oid as i64).collect();
         let mut active_levels = Vec::new();
+        let mut offline_fills: Vec<(usize, Side)> = Vec::new();
         for o in &db_orders {
             match o.exchange_oid {
                 Some(oid) if live.contains(&oid) => active_levels.push(o.level as usize),
-                Some(_) => {
+                Some(oid) => {
                     info!(level = o.level, "order no longer on book; marking filled");
                     self.store.set_status(o.id, OrderStatus::Filled).await?;
+                    self.store
+                        .record_fill(oid as u64, &coin, o.side, o.price, o.size)
+                        .await?;
+                    offline_fills.push((o.level as usize, o.side));
                 }
                 None => {}
             }
         }
+
+        // Replay the offline fills: seed each counter order, letting any that
+        // cross the current mid fill immediately and cascade.
+        if !offline_fills.is_empty() {
+            let mid = self.exchange.mid_price(&coin).await?;
+            for (level, side) in offline_fills {
+                for counter in self.strategy.on_fill(level, side) {
+                    if let Err(e) = self.submit_order(counter.clone(), mid).await {
+                        error!(
+                            "failed to seed reconcile counter at level {}: {e}",
+                            counter.level
+                        );
+                    }
+                }
+            }
+            // Recompute the live levels after seeding follow-ups.
+            active_levels = self
+                .store
+                .open_orders(&coin)
+                .await?
+                .iter()
+                .map(|o| o.level as usize)
+                .collect();
+        }
         Ok(active_levels)
     }
 
-    /// Places an order on the exchange and persists it.
-    pub async fn place_and_persist(&self, order: &DesiredOrder) -> anyhow::Result<()> {
+    /// Submits a desired order, deciding from `mid` whether it rests on the book
+    /// or crosses and fills immediately, and cascading any follow-up counter
+    /// orders the strategy dictates for an immediate fill.
+    ///
+    /// A crossing order (a sell at/below the mid, or a buy at/above it) is sent
+    /// as a marketable limit priced at the mid so it fills right away; the fill
+    /// is recorded and the counter order(s) seeded, which may themselves cross.
+    /// Resting orders are placed at their grid price. Orders that would duplicate
+    /// an already-live leg are skipped (see [`Bot::should_skip`]).
+    pub async fn submit_order(&self, order: DesiredOrder, mid: f64) -> anyhow::Result<()> {
+        let mut queue: VecDeque<DesiredOrder> = VecDeque::new();
+        queue.push_back(order);
+        let mut processed = 0usize;
+        while let Some(o) = queue.pop_front() {
+            processed += 1;
+            if processed > MAX_FOLLOWUPS {
+                warn!("follow-up cascade exceeded {MAX_FOLLOWUPS}; stopping");
+                break;
+            }
+            if self.should_skip(&o, mid).await? {
+                continue;
+            }
+            // Cross the spread (fill now) for a sell at/below or a buy at/above
+            // the mid; otherwise rest at the grid price.
+            let crosses = match o.side {
+                Side::Sell => o.price <= mid,
+                Side::Buy => o.price >= mid,
+            };
+            let place_price = if crosses { mid } else { o.price };
+            let placed = match self.place_and_persist(&o, place_price).await {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("failed to place order at level {}: {e}", o.level);
+                    continue;
+                }
+            };
+            // The exchange tells us whether it rested or filled immediately.
+            if !placed.resting {
+                self.store
+                    .record_fill(placed.oid, self.coin(), o.side, place_price, o.size)
+                    .await?;
+                if let Some(row) = self.store.order_by_exchange_oid(placed.oid).await? {
+                    self.store.set_status(row.id, OrderStatus::Filled).await?;
+                }
+                info!(
+                    level = o.level,
+                    side = ?o.side,
+                    price = place_price,
+                    "order filled immediately"
+                );
+                for counter in self.strategy.on_fill(o.level, o.side) {
+                    queue.push_back(counter);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decides whether a desired order would duplicate work already on the book.
+    ///
+    /// Skips an order whose (level, side) already rests, and skips an
+    /// open-short sell whose short is already open — represented by a resting
+    /// reduce-only buy one line below — so a restart does not re-open a position
+    /// the bot is already holding.
+    async fn should_skip(&self, order: &DesiredOrder, mid: f64) -> anyhow::Result<bool> {
+        let open = self.store.open_orders(self.coin()).await?;
+        if open
+            .iter()
+            .any(|o| o.level as usize == order.level && o.side == order.side)
+        {
+            return Ok(true);
+        }
+        // An opening sell that crosses would open a short. If the matching
+        // take-profit buy one line below is already resting, the short is
+        // already open; don't open another.
+        if order.side == Side::Sell && !order.reduce_only && order.price <= mid && order.level >= 1
+        {
+            let below = order.level - 1;
+            if open
+                .iter()
+                .any(|o| o.level as usize == below && o.side == Side::Buy && o.reduce_only)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Places an order on the exchange at `price` and persists it, returning the
+    /// exchange acknowledgement (which reports whether it rested or filled).
+    pub async fn place_and_persist(
+        &self,
+        order: &DesiredOrder,
+        price: f64,
+    ) -> anyhow::Result<crate::exchange::PlacedOrder> {
         let coin = self.coin().to_string();
         let new_order = NewGridOrder {
             coin: coin.clone(),
             level: order.level as i32,
             side: order.side,
-            price: order.price,
+            price,
             size: order.size,
             reduce_only: order.reduce_only,
         };
@@ -139,7 +268,7 @@ impl Bot {
         let req = PlaceOrder {
             coin,
             side: order.side,
-            price: order.price,
+            price,
             size: order.size,
             reduce_only: order.reduce_only,
         };
@@ -149,11 +278,12 @@ impl Bot {
                 info!(
                     level = order.level,
                     side = ?order.side,
-                    price = order.price,
+                    price,
                     oid = placed.oid,
+                    resting = placed.resting,
                     "order placed"
                 );
-                Ok(())
+                Ok(placed)
             }
             Err(e) => {
                 self.store.set_status(id, OrderStatus::Cancelled).await?;
@@ -162,7 +292,7 @@ impl Bot {
         }
     }
 
-    /// Handles a fill: records it, marks the order filled and places the
+    /// Handles a fill: records it, marks the order filled and submits the
     /// counter order(s) dictated by the strategy.
     pub async fn handle_fill(&self, fill: &FillEvent) -> anyhow::Result<()> {
         self.store
@@ -184,23 +314,15 @@ impl Bot {
         self.store.set_status(order.id, OrderStatus::Filled).await?;
         info!(level = order.level, side = ?order.side, "order filled");
 
+        // Use the fill price as the market reference for the counter legs.
         let counters = self.strategy.on_fill(order.level as usize, order.side);
         for c in counters {
-            if self.has_open_at_level(c.level).await? {
-                continue; // avoid duplicating an already-live level
-            }
-            if let Err(e) = self.place_and_persist(&c).await {
-                error!("failed to place counter order at level {}: {e}", c.level);
+            if let Err(e) = self.submit_order(c.clone(), fill.price).await {
+                error!("failed to submit counter order at level {}: {e}", c.level);
             }
         }
         Ok(())
     }
-
-    async fn has_open_at_level(&self, level: usize) -> anyhow::Result<bool> {
-        let open = self.store.open_orders(self.coin()).await?;
-        Ok(open.iter().any(|o| o.level as usize == level))
-    }
-
     /// Snapshots the current position and evaluates risk limits, returning the
     /// verdict.
     pub async fn check_risk(&self) -> anyhow::Result<RiskVerdict> {

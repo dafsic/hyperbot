@@ -40,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
         risk,
         config.exchange.leverage,
         config.exchange.cross_margin,
-    );
+    )
+    .with_cancel_on_exit(config.exchange.cancel_on_exit);
 
     let shutdown = async {
         if let Err(e) = tokio::signal::ctrl_c().await {

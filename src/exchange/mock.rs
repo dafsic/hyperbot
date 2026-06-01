@@ -117,6 +117,25 @@ impl Exchange for MockExchange {
         let mut inner = self.inner.lock().unwrap();
         let oid = inner.next_oid;
         inner.next_oid += 1;
+        // A crossing limit order fills immediately against the current mid: a
+        // sell priced at or below the mid, or a buy priced at or above it. Such
+        // an order never rests; it updates the position right away. This mirrors
+        // a live venue and lets the bot open shorts (or close them) on startup.
+        let crosses = match req.side {
+            Side::Sell => req.price <= inner.mid,
+            Side::Buy => req.price >= inner.mid,
+        };
+        if crosses {
+            let signed = match req.side {
+                Side::Buy => req.size,
+                Side::Sell => -req.size,
+            };
+            inner.position += signed;
+            return Ok(PlacedOrder {
+                oid,
+                resting: false,
+            });
+        }
         inner.orders.insert(
             oid,
             OpenOrder {

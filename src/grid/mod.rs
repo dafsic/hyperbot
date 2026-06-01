@@ -140,9 +140,14 @@ impl GridStrategy {
     /// Computes the set of orders to place when (re)starting the grid given the
     /// current `mid` price and the set of levels that already have a live order.
     ///
-    /// For a short-only grid this seeds a sell order on every line strictly
-    /// above the mid price. Buy (take-profit) legs are only created later, once
-    /// a sell has been filled, so the net position can never become positive.
+    /// For a short-only grid this seeds a sell (open-short) leg on **every** grid
+    /// line except the lowest one (which only ever hosts a take-profit buy).
+    /// Lines above the mid price rest on the book; lines at or below the mid are
+    /// crossing orders that fill immediately, opening the short. The caller is
+    /// responsible for detecting the immediate fills (see [`GridStrategy::on_fill`])
+    /// and seeding the matching reduce-only buy one line below. Buy legs are only
+    /// ever created in response to a sell fill, so the net position can never
+    /// become positive.
     pub fn initial_orders(&self, mid: f64, active_levels: &[usize]) -> Vec<DesiredOrder> {
         let size = self.params.order_size;
         let mut out = Vec::new();
@@ -152,7 +157,9 @@ impl GridStrategy {
             }
             match self.params.mode {
                 GridMode::ShortOnly => {
-                    if price > mid {
+                    // Seed a sell on every line but the lowest. Whether it rests
+                    // or fills immediately is decided by the caller from the mid.
+                    if level >= 1 {
                         out.push(DesiredOrder {
                             level,
                             price,
@@ -367,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn short_only_initial_orders_are_all_sells_above_mid() {
+    fn short_only_initial_orders_seed_a_sell_on_every_line_but_the_lowest() {
         let s = GridStrategy::new(short_params()).unwrap();
         // mid in the middle of the grid (150). Levels are 100,110,...,200.
         let orders = s.initial_orders(150.0, &[]);
@@ -375,10 +382,15 @@ mod tests {
         for o in &orders {
             assert_eq!(o.side, Side::Sell);
             assert!(!o.reduce_only);
-            assert!(o.price > 150.0);
         }
-        // levels strictly above 150: 160,170,180,190,200 => 5 orders.
-        assert_eq!(orders.len(), 5);
+        // A sell is seeded on every line except the lowest (level 0 == price 100):
+        // levels 1..=10 => 10 orders.
+        assert_eq!(orders.len(), 10);
+        assert!(orders.iter().all(|o| o.level != 0));
+        // Lines at or below the mid (110..=150) are seeded too; the bot fills
+        // those immediately. Here level 1 (price 110) up to level 5 (price 150).
+        assert!(orders.iter().any(|o| o.level == 1 && o.price <= 150.0));
+        assert!(orders.iter().any(|o| o.level == 5 && o.price <= 150.0));
     }
 
     #[test]
@@ -388,6 +400,36 @@ mod tests {
         let with_active = s.initial_orders(150.0, &[10]); // level 10 == price 200
         assert_eq!(with_active.len(), all.len() - 1);
         assert!(with_active.iter().all(|o| o.level != 10));
+    }
+
+    #[test]
+    fn short_only_seeds_a_mid_range_grid() {
+        // Requirement scenario: mid = 100, region 80..120 step 10.
+        let s = GridStrategy::new(GridParams {
+            coin: "XMR".into(),
+            lower_price: 80.0,
+            upper_price: 120.0,
+            grid_count: 4,
+            spacing: Spacing::Arithmetic,
+            order_size: 1.0,
+            mode: GridMode::ShortOnly,
+        })
+        .unwrap();
+        // Levels: 0=80, 1=90, 2=100, 3=110, 4=120.
+        let orders = s.initial_orders(100.0, &[]);
+        // Sells on every line but the lowest (80): 90, 100, 110, 120 => 4 orders.
+        assert_eq!(orders.len(), 4);
+        assert!(orders
+            .iter()
+            .all(|o| o.side == Side::Sell && !o.reduce_only));
+        // Lines at or below mid (90, 100) are crossing orders -> immediate short.
+        assert!(orders.iter().any(|o| o.level == 1 && o.price <= 100.0));
+        assert!(orders.iter().any(|o| o.level == 2 && o.price <= 100.0));
+        // Lines above mid (110, 120) rest on the book.
+        assert!(orders.iter().any(|o| o.level == 3 && o.price > 100.0));
+        assert!(orders.iter().any(|o| o.level == 4 && o.price > 100.0));
+        // The lowest line (80) only ever hosts a take-profit buy.
+        assert!(orders.iter().all(|o| o.level != 0));
     }
 
     #[test]
