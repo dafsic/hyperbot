@@ -14,6 +14,9 @@ private_key = ""
 leverage = 2
 # true = cross margin, false = isolated margin.
 cross_margin = false
+# Cancel all resting orders when the bot shuts down. Keep false to preserve the
+# grid across restarts; the bot reconciles and re-seeds on the next startup.
+cancel_on_exit = false
 
 [grid]
 # Perp coin symbol. The XMR/USDC perpetual is referenced as "XMR".

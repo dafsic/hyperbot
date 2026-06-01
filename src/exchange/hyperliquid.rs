@@ -312,7 +312,13 @@ mod tests {
             cloid: None,
         })
         .unwrap();
-        assert_eq!(resting, PlacedOrder { oid: 7, resting: true });
+        assert_eq!(
+            resting,
+            PlacedOrder {
+                oid: 7,
+                resting: true
+            }
+        );
 
         let filled = parse_place_response(OrderResponseStatus::Filled {
             total_sz: Decimal::ZERO,
