@@ -29,8 +29,12 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Store::connect(&config.database.url, config.database.max_connections).await?;
 
-    let exchange =
-        HyperliquidExchange::new(&config.exchange.private_key, config.exchange.network).await?;
+    let exchange = HyperliquidExchange::new(
+        &config.exchange.private_key,
+        &config.exchange.account_address,
+        config.exchange.network,
+    )
+    .await?;
     let exchange: Arc<dyn Exchange> = Arc::new(exchange);
 
     let bot = Bot::new(

@@ -11,7 +11,6 @@ pub use hyperliquid::HyperliquidExchange;
 pub use mock::MockExchange;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::grid::Side;
 
@@ -68,7 +67,7 @@ pub struct Position {
     pub unrealized_pnl: f64,
 }
 
-/// A fill event received from the exchange stream.
+/// A fill reported by the exchange's own fill history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FillEvent {
     /// Exchange order id that was filled.
@@ -81,15 +80,9 @@ pub struct FillEvent {
     pub price: f64,
     /// Fill size.
     pub size: f64,
-}
-
-/// Events emitted by [`Exchange::subscribe`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExchangeEvent {
-    /// New mid price for the traded coin.
-    Mid(f64),
-    /// One of our orders was (partially) filled.
-    Fill(FillEvent),
+    /// Fill timestamp in milliseconds since the Unix epoch. Used as a watermark
+    /// so periodic polling only fetches fills newer than the last one seen.
+    pub time: u64,
 }
 
 /// Abstraction over a trading venue.
@@ -110,9 +103,24 @@ pub trait Exchange: Send + Sync {
     /// Lists currently open orders for `coin`.
     async fn open_orders(&self, coin: &str) -> anyhow::Result<Vec<OpenOrder>>;
 
+    /// Returns fills for `coin` from the exchange's own fill history, limited to
+    /// those at or after `since_ms` (milliseconds since the Unix epoch).
+    ///
+    /// This is the **authoritative** source of fills. The bot detects filled
+    /// orders by periodically polling this history and matching fills back to
+    /// tracked orders by `oid`. Unlike inferring fills from the absence of an
+    /// order on the book (which is unsafe when a book snapshot is incomplete), a
+    /// fill reported here definitely happened.
+    ///
+    /// `since_ms` bounds the volume so a long-running bot does not re-fetch and
+    /// re-scan its entire (capped, but still large) fill history every tick:
+    /// callers pass the timestamp of the last fill they processed. The window is
+    /// **inclusive** of `since_ms`, so the boundary fill may be returned again;
+    /// callers must deduplicate (which the bot already does by order status).
+    /// Pass `0` to fetch the full available history (e.g. on startup, to catch
+    /// fills that happened while the bot was offline).
+    async fn recent_fills(&self, coin: &str, since_ms: u64) -> anyhow::Result<Vec<FillEvent>>;
+
     /// Returns the current position for `coin`, if any.
     async fn position(&self, coin: &str) -> anyhow::Result<Option<Position>>;
-
-    /// Subscribes to mid-price and fill events for `coin`.
-    async fn subscribe(&self, coin: &str) -> anyhow::Result<UnboundedReceiver<ExchangeEvent>>;
 }

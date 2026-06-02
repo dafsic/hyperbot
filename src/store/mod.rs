@@ -252,30 +252,6 @@ impl Store {
         .context("snapshotting position")?;
         Ok(())
     }
-
-    /// Sets a runtime state value (upsert).
-    pub async fn set_state(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO bot_state (key, value, updated_at) VALUES ($1, $2, now()) \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await
-        .context("setting bot state")?;
-        Ok(())
-    }
-
-    /// Reads a runtime state value.
-    pub async fn get_state(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let v = sqlx::query_scalar::<_, String>("SELECT value FROM bot_state WHERE key = $1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .context("reading bot state")?;
-        Ok(v)
-    }
 }
 
 #[cfg(test)]

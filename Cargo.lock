@@ -2800,7 +2800,6 @@ dependencies = [
  "approx",
  "async-trait",
  "chrono",
- "futures",
  "hypersdk",
  "rust_decimal",
  "serde",

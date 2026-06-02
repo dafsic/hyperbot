@@ -51,7 +51,7 @@ async fn make_store(url: &str) -> Store {
         .expect("connect");
     // Clean slate so the test is repeatable.
     sqlx::query(
-        "DROP TABLE IF EXISTS grid_orders, fills, position_snapshots, bot_state, \
+        "DROP TABLE IF EXISTS grid_orders, fills, position_snapshots, \
          _sqlx_migrations CASCADE",
     )
     .execute(&pool)

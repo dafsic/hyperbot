@@ -10,6 +10,11 @@
 network = "testnet"
 # Leave empty: provided via HYPERBOT_PRIVATE_KEY.
 private_key = ""
+# Main account address for info queries (open orders / fills / positions). Set
+# this ONLY when private_key is an agent / API wallet key, whose address differs
+# from the funded master account. Leave empty to use the key's own address.
+# Provide via HYPERBOT_ACCOUNT_ADDRESS. Example: "0xYourMainAccount".
+account_address = ""
 # Leverage applied to the coin before trading.
 leverage = 2
 # true = cross margin, false = isolated margin.

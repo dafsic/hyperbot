@@ -43,10 +43,3 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
     unrealized_pnl DOUBLE PRECISION NOT NULL,
     created_at     TIMESTAMPTZ      NOT NULL DEFAULT now()
 );
-
--- Simple key/value store for bot runtime state.
-CREATE TABLE IF NOT EXISTS bot_state (
-    key        TEXT PRIMARY KEY,
-    value      TEXT        NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);

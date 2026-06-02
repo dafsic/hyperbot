@@ -4,18 +4,15 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use futures::StreamExt;
 use hypersdk::hypercore::types::{
-    BatchCancel, BatchOrder, Cancel, Incoming, OrderGrouping, OrderRequest, OrderResponseStatus,
-    OrderTypePlacement, Side as HlSide, Subscription, TimeInForce, UserEvent,
+    BatchCancel, BatchOrder, Cancel, OrderGrouping, OrderRequest, OrderResponseStatus,
+    OrderTypePlacement, Side as HlSide, TimeInForce,
 };
-use hypersdk::hypercore::{self, HttpClient, PrivateKeySigner, WebSocket};
+use hypersdk::hypercore::{self, HttpClient, PerpMarket, PrivateKeySigner};
 use hypersdk::{Address, Decimal};
 use rust_decimal::prelude::ToPrimitive;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tracing::warn;
 
-use super::{Exchange, ExchangeEvent, FillEvent, OpenOrder, PlaceOrder, PlacedOrder, Position};
+use super::{Exchange, FillEvent, OpenOrder, PlaceOrder, PlacedOrder, Position};
 use crate::config::Network;
 use crate::grid::Side;
 
@@ -24,10 +21,10 @@ pub struct HyperliquidExchange {
     client: HttpClient,
     signer: PrivateKeySigner,
     user_address: Address,
-    network: Network,
-    /// Maps a coin symbol (e.g. `"XMR"`) to its numeric perp asset index, which
-    /// the signed order/cancel/leverage actions require.
-    coin_to_asset: HashMap<String, usize>,
+    /// Maps a coin symbol (e.g. `"XMR"`) to its perp market metadata, which
+    /// supplies the asset index plus the tick/lot sizing the signed
+    /// order/cancel/leverage actions require.
+    coin_to_market: HashMap<String, PerpMarket>,
 }
 
 /// Builds an HTTP client for `network`.
@@ -35,14 +32,6 @@ fn http_client(network: Network) -> HttpClient {
     match network {
         Network::Mainnet => hypercore::mainnet(),
         Network::Testnet => hypercore::testnet(),
-    }
-}
-
-/// Builds a websocket connection for `network`.
-fn websocket(network: Network) -> WebSocket {
-    match network {
-        Network::Mainnet => hypercore::mainnet_ws(),
-        Network::Testnet => hypercore::testnet_ws(),
     }
 }
 
@@ -73,29 +62,50 @@ fn nonce() -> u64 {
 
 impl HyperliquidExchange {
     /// Connects to Hyperliquid using `private_key` on `network`.
-    pub async fn new(private_key: &str, network: Network) -> anyhow::Result<Self> {
+    ///
+    /// `account_address`, when non-empty, is the master account to run all info
+    /// queries against; pass it when `private_key` is an agent / API wallet key
+    /// whose derived address is not the funded account. When empty, the address
+    /// derived from `private_key` is used.
+    pub async fn new(
+        private_key: &str,
+        account_address: &str,
+        network: Network,
+    ) -> anyhow::Result<Self> {
         let signer: PrivateKeySigner = private_key
             .trim()
             .trim_start_matches("0x")
             .parse()
             .context("invalid private key")?;
-        let user_address = signer.address();
+        let user_address = if account_address.trim().is_empty() {
+            signer.address()
+        } else {
+            account_address
+                .trim()
+                .parse()
+                .context("invalid account_address")?
+        };
         let client = http_client(network);
 
-        // The perp metadata gives us the coin -> asset-index mapping needed for
-        // every signed action.
+        // The perp metadata gives us the coin -> market mapping needed for
+        // every signed action and for rounding prices/sizes to valid ticks.
         let perps = client
             .perps()
             .await
             .map_err(|e| anyhow!("fetching perp metadata: {e}"))?;
-        let coin_to_asset = perps.into_iter().map(|m| (m.name, m.index)).collect();
+        let coin_to_market = perps.into_iter().map(|m| (m.name.clone(), m)).collect();
+
+        tracing::info!(
+            signer = %signer.address(),
+            query_address = %user_address,
+            "hyperliquid client ready"
+        );
 
         Ok(Self {
             client,
             signer,
             user_address,
-            network,
-            coin_to_asset,
+            coin_to_market,
         })
     }
 
@@ -104,12 +114,16 @@ impl HyperliquidExchange {
         self.user_address
     }
 
+    /// Resolves a coin symbol to its perp market metadata.
+    fn market(&self, coin: &str) -> anyhow::Result<&PerpMarket> {
+        self.coin_to_market
+            .get(coin)
+            .ok_or_else(|| anyhow!("unknown coin {coin}"))
+    }
+
     /// Resolves a coin symbol to its numeric perp asset index.
     fn asset_index(&self, coin: &str) -> anyhow::Result<usize> {
-        self.coin_to_asset
-            .get(coin)
-            .copied()
-            .ok_or_else(|| anyhow!("unknown coin {coin}"))
+        Ok(self.market(coin)?.index)
     }
 }
 
@@ -137,12 +151,19 @@ impl Exchange for HyperliquidExchange {
     }
 
     async fn place_order(&self, req: &PlaceOrder) -> anyhow::Result<PlacedOrder> {
-        let asset = self.asset_index(&req.coin)?;
+        let market = self.market(&req.coin)?;
+        // Hyperliquid rejects orders whose price is not on a valid tick or whose
+        // size exceeds the market's size precision; round both before signing.
+        let price = market
+            .round_price(to_decimal(req.price)?)
+            .ok_or_else(|| anyhow!("invalid price {} for {}", req.price, req.coin))?;
+        let sz_decimals = market.sz_decimals.clamp(0, u32::MAX as i64) as u32;
+        let sz = to_decimal(req.size)?.round_dp(sz_decimals);
         let order = OrderRequest {
-            asset,
+            asset: market.index,
             is_buy: req.side.is_buy(),
-            limit_px: to_decimal(req.price)?,
-            sz: to_decimal(req.size)?,
+            limit_px: price,
+            sz,
             reduce_only: req.reduce_only,
             order_type: OrderTypePlacement::Limit {
                 tif: TimeInForce::Gtc,
@@ -206,6 +227,42 @@ impl Exchange for HyperliquidExchange {
         Ok(out)
     }
 
+    async fn recent_fills(&self, coin: &str, since_ms: u64) -> anyhow::Result<Vec<FillEvent>> {
+        // Time-windowed query so a long-running bot only pulls fills newer than
+        // the last one it processed, instead of re-fetching the full (capped but
+        // large) history every tick.
+        let fills = self
+            .client
+            .user_fills_by_time(self.user_address, since_ms, None)
+            .await
+            .map_err(|e| anyhow!("user_fills_by_time: {e}"))?;
+        let raw = fills.len();
+        let mut out = Vec::new();
+        for f in fills {
+            if f.coin != coin {
+                continue;
+            }
+            out.push(FillEvent {
+                oid: f.oid,
+                coin: f.coin.clone(),
+                side: map_side(f.side),
+                price: to_f64(f.px),
+                size: to_f64(f.sz),
+                time: f.time,
+            });
+        }
+        tracing::debug!(
+            user = %self.user_address,
+            coin,
+            since_ms,
+            raw,
+            matched = out.len(),
+            oids = ?out.iter().map(|f| f.oid).collect::<Vec<_>>(),
+            "fetched user_fills_by_time"
+        );
+        Ok(out)
+    }
+
     async fn position(&self, coin: &str) -> anyhow::Result<Option<Position>> {
         let state = self
             .client
@@ -224,61 +281,6 @@ impl Exchange for HyperliquidExchange {
             }
         }
         Ok(None)
-    }
-
-    async fn subscribe(&self, coin: &str) -> anyhow::Result<UnboundedReceiver<ExchangeEvent>> {
-        // A dedicated websocket connection owns the subscription so the shared
-        // `self.client` used for REST queries is untouched.
-        let mut ws = websocket(self.network);
-        ws.subscribe(Subscription::AllMids { dex: None });
-        ws.subscribe(Subscription::UserEvents {
-            user: self.user_address,
-        });
-
-        let (tx, rx) = unbounded_channel();
-        let coin = coin.to_string();
-        tokio::spawn(async move {
-            // `ws` is moved in to keep the connection alive for the task.
-            while let Some(event) = ws.next().await {
-                let message = match event {
-                    hypercore::ws::Event::Message(message) => message,
-                    hypercore::ws::Event::Connected => continue,
-                    hypercore::ws::Event::Disconnected => {
-                        warn!("hyperliquid websocket disconnected; reconnecting");
-                        continue;
-                    }
-                };
-                match message {
-                    Incoming::AllMids { mids, .. } => {
-                        if let Some(px) = mids.get(&coin) {
-                            if tx.send(ExchangeEvent::Mid(to_f64(*px))).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Incoming::UserEvents(UserEvent::Fills { fills }) => {
-                        for fill in fills {
-                            if fill.coin != coin {
-                                continue;
-                            }
-                            let event = FillEvent {
-                                oid: fill.oid,
-                                coin: fill.coin.clone(),
-                                side: map_side(fill.side),
-                                price: to_f64(fill.px),
-                                size: to_f64(fill.sz),
-                            };
-                            if tx.send(ExchangeEvent::Fill(event)).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        Ok(rx)
     }
 }
 

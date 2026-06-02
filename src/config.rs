@@ -46,6 +46,15 @@ pub struct ExchangeConfig {
     /// `HYPERBOT_PRIVATE_KEY` environment variable; leave empty in the file.
     #[serde(default)]
     pub private_key: String,
+    /// Main account address (hex, `0x`-prefixed) to query orders/fills/positions
+    /// for. Set this when `private_key` is an **agent / API wallet** key, whose
+    /// derived address differs from the funded master account: signing uses the
+    /// agent key but all info queries (`open_orders`, `user_fills`,
+    /// `clearinghouse_state`) must target the master account where orders, fills
+    /// and positions actually live. Leave empty to use the key's own address.
+    /// Inject via the `HYPERBOT_ACCOUNT_ADDRESS` environment variable.
+    #[serde(default)]
+    pub account_address: String,
     /// Leverage to set for the traded coin before the grid starts.
     #[serde(default = "default_leverage")]
     pub leverage: u32,
@@ -179,6 +188,11 @@ impl Config {
         if let Ok(v) = std::env::var("HYPERBOT_PRIVATE_KEY") {
             if !v.is_empty() {
                 self.exchange.private_key = v;
+            }
+        }
+        if let Ok(v) = std::env::var("HYPERBOT_ACCOUNT_ADDRESS") {
+            if !v.is_empty() {
+                self.exchange.account_address = v;
             }
         }
         if let Ok(v) = std::env::var("DATABASE_URL") {

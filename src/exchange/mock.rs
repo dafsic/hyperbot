@@ -4,9 +4,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use super::{Exchange, ExchangeEvent, FillEvent, OpenOrder, PlaceOrder, PlacedOrder, Position};
+use super::{Exchange, FillEvent, OpenOrder, PlaceOrder, PlacedOrder, Position};
 use crate::grid::Side;
 
 /// Deterministic, in-memory implementation of [`Exchange`].
@@ -23,7 +22,11 @@ struct Inner {
     orders: HashMap<u64, OpenOrder>,
     position: f64,
     leverage: u32,
-    event_tx: Option<UnboundedSender<ExchangeEvent>>,
+    /// Monotonic clock (ms) stamped on each fill, mirroring the exchange's
+    /// fill timestamps so `recent_fills` can honour a `since_ms` window.
+    clock: u64,
+    /// Authoritative log of every fill, mirroring the exchange's `user_fills`.
+    fills: Vec<FillEvent>,
 }
 
 impl MockExchange {
@@ -36,7 +39,8 @@ impl MockExchange {
                 orders: HashMap::new(),
                 position: 0.0,
                 leverage: 1,
-                event_tx: None,
+                clock: 1,
+                fills: Vec::new(),
             }),
         }
     }
@@ -64,8 +68,8 @@ impl MockExchange {
         self.inner.lock().unwrap().leverage
     }
 
-    /// Simulates a fill of a resting order, updating the position and emitting a
-    /// [`ExchangeEvent::Fill`] to any subscriber. Returns the fill event.
+    /// Simulates a fill of a resting order, updating the position and appending
+    /// the fill to the authoritative fill log. Returns the fill event.
     pub fn fill(&self, oid: u64) -> Option<FillEvent> {
         let mut inner = self.inner.lock().unwrap();
         let order = inner.orders.remove(&oid)?;
@@ -74,26 +78,23 @@ impl MockExchange {
             Side::Sell => -order.size,
         };
         inner.position += signed;
+        let time = inner.clock;
+        inner.clock += 1;
         let event = FillEvent {
             oid,
             coin: order.coin.clone(),
             side: order.side,
             price: order.price,
             size: order.size,
+            time,
         };
-        if let Some(tx) = &inner.event_tx {
-            let _ = tx.send(ExchangeEvent::Fill(event.clone()));
-        }
+        inner.fills.push(event.clone());
         Some(event)
     }
 
-    /// Pushes a new mid price to subscribers.
+    /// Sets a new mid price.
     pub fn push_mid(&self, mid: f64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.mid = mid;
-        if let Some(tx) = &inner.event_tx {
-            let _ = tx.send(ExchangeEvent::Mid(mid));
-        }
+        self.inner.lock().unwrap().mid = mid;
     }
 }
 
@@ -131,6 +132,16 @@ impl Exchange for MockExchange {
                 Side::Sell => -req.size,
             };
             inner.position += signed;
+            let time = inner.clock;
+            inner.clock += 1;
+            inner.fills.push(FillEvent {
+                oid,
+                coin: req.coin.clone(),
+                side: req.side,
+                price: req.price,
+                size: req.size,
+                time,
+            });
             return Ok(PlacedOrder {
                 oid,
                 resting: false,
@@ -166,6 +177,16 @@ impl Exchange for MockExchange {
         Ok(v)
     }
 
+    async fn recent_fills(&self, coin: &str, since_ms: u64) -> anyhow::Result<Vec<FillEvent>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .fills
+            .iter()
+            .filter(|f| f.coin == coin && f.time >= since_ms)
+            .cloned()
+            .collect())
+    }
+
     async fn position(&self, coin: &str) -> anyhow::Result<Option<Position>> {
         let inner = self.inner.lock().unwrap();
         if inner.position == 0.0 {
@@ -177,12 +198,6 @@ impl Exchange for MockExchange {
             entry_price: Some(inner.mid),
             unrealized_pnl: 0.0,
         }))
-    }
-
-    async fn subscribe(&self, _coin: &str) -> anyhow::Result<UnboundedReceiver<ExchangeEvent>> {
-        let (tx, rx) = unbounded_channel();
-        self.inner.lock().unwrap().event_tx = Some(tx);
-        Ok(rx)
     }
 }
 
