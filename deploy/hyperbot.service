@@ -1,0 +1,54 @@
+[Unit]
+Description=Hyperbot grid trading bot
+Documentation=https://github.com/dafsic/hyperbot
+# Wait for network and (if running Postgres on the same host) the database.
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hyperbot
+Group=hyperbot
+
+# Working directory holds config.toml (optional — built-in defaults are used if
+# absent) and is where relative paths resolve.
+WorkingDirectory=/opt/hyperbot
+
+# Absolute path to the release binary.
+ExecStart=/opt/hyperbot/hyperbot
+
+# --- Secrets via systemd encrypted credentials ---
+# Each credential is decrypted at start into $CREDENTIALS_DIRECTORY/<id> on a
+# per-service tmpfs that ONLY this process can read; it is never written to disk
+# in plaintext and is not visible to other users (not even via the unit file).
+# The bot reads these ids: private_key, database_url, account_address.
+# Create them once (see deploy notes) and reference them here:
+LoadCredentialEncrypted=private_key:/etc/hyperbot/credentials/private_key.cred
+LoadCredentialEncrypted=database_url:/etc/hyperbot/credentials/database_url.cred
+# Optional — omit if you keep account_address in config.toml / defaults:
+LoadCredentialEncrypted=account_address:/etc/hyperbot/credentials/account_address.cred
+
+# Log level (override with `systemctl edit hyperbot` if needed).
+Environment=RUST_LOG=info
+
+# Graceful shutdown: systemd sends SIGTERM, the bot handles it and exits
+# cleanly. Give it time to finish in-flight work before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart on crash, but back off so a hard-failing config does not hot-loop.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- Hardening (optional but recommended) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Allow writing only where needed (none by default; the bot writes to Postgres,
+# not the filesystem). Add ReadWritePaths=/opt/hyperbot if you later log to a file.
+
+[Install]
+WantedBy=multi-user.target

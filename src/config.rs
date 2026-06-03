@@ -23,16 +23,19 @@ pub enum Network {
 }
 
 /// Top-level configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Exchange / wallet settings.
+    #[serde(default)]
     pub exchange: ExchangeConfig,
     /// Grid strategy settings.
+    #[serde(default)]
     pub grid: GridConfig,
     /// Risk-control settings.
     #[serde(default)]
     pub risk: RiskConfig,
     /// Database settings.
+    #[serde(default)]
     pub database: DatabaseConfig,
 }
 
@@ -53,7 +56,7 @@ pub struct ExchangeConfig {
     /// `clearinghouse_state`) must target the master account where orders, fills
     /// and positions actually live. Leave empty to use the key's own address.
     /// Inject via the `HYPERBOT_ACCOUNT_ADDRESS` environment variable.
-    #[serde(default)]
+    #[serde(default = "default_account_address")]
     pub account_address: String,
     /// Leverage to set for the traded coin before the grid starts.
     #[serde(default = "default_leverage")]
@@ -68,8 +71,25 @@ pub struct ExchangeConfig {
     pub cancel_on_exit: bool,
 }
 
+impl Default for ExchangeConfig {
+    fn default() -> Self {
+        Self {
+            network: Network::default(),
+            private_key: String::new(),
+            account_address: default_account_address(),
+            leverage: default_leverage(),
+            cross_margin: false,
+            cancel_on_exit: false,
+        }
+    }
+}
+
+fn default_account_address() -> String {
+    "0xf581803C5998FAb668Ee4E0826eCf8e2Ca3f469b".to_string()
+}
+
 fn default_leverage() -> u32 {
-    1
+    3
 }
 
 /// Grid strategy configuration (a serializable mirror of [`GridParams`]).
@@ -79,23 +99,57 @@ pub struct GridConfig {
     #[serde(default = "default_coin")]
     pub coin: String,
     /// Lower price bound.
+    #[serde(default = "default_lower_price")]
     pub lower_price: f64,
     /// Upper price bound.
+    #[serde(default = "default_upper_price")]
     pub upper_price: f64,
     /// Number of grid intervals.
+    #[serde(default = "default_grid_count")]
     pub grid_count: usize,
     /// Spacing strategy.
     #[serde(default)]
     pub spacing: Spacing,
     /// Order size (contracts) per grid line.
+    #[serde(default = "default_order_size")]
     pub order_size: f64,
     /// Trade direction restriction.
     #[serde(default)]
     pub mode: GridMode,
 }
 
+impl Default for GridConfig {
+    fn default() -> Self {
+        Self {
+            coin: default_coin(),
+            lower_price: default_lower_price(),
+            upper_price: default_upper_price(),
+            grid_count: default_grid_count(),
+            spacing: Spacing::default(),
+            order_size: default_order_size(),
+            mode: GridMode::default(),
+        }
+    }
+}
+
 fn default_coin() -> String {
     "XMR".to_string()
+}
+
+fn default_lower_price() -> f64 {
+    340.0
+}
+
+fn default_upper_price() -> f64 {
+    360.0
+}
+
+fn default_grid_count() -> usize {
+    10
+}
+
+fn default_order_size() -> f64 {
+    0.1
 }
 
 impl GridConfig {
@@ -129,7 +183,7 @@ pub struct RiskConfig {
 }
 
 fn default_max_leverage() -> u32 {
-    20
+    5
 }
 
 impl Default for RiskConfig {
@@ -153,8 +207,36 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
 }
 
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            max_connections: default_max_connections(),
+        }
+    }
+}
+
 fn default_max_connections() -> u32 {
     5
+}
+
+/// Reads a systemd-supplied credential named `id`, if present.
+///
+/// When a unit declares `LoadCredentialEncrypted=<id>:<path>` (or
+/// `LoadCredential=`), systemd decrypts it into `$CREDENTIALS_DIRECTORY/<id>` on
+/// a per-service tmpfs that only this process can read, and never writes it to
+/// disk in plaintext. Returns the trimmed contents, or `None` when the variable
+/// is unset (not running under systemd) or the file is missing/empty.
+fn load_credential(id: &str) -> Option<String> {
+    let dir = std::env::var_os("CREDENTIALS_DIRECTORY")?;
+    let path = Path::new(&dir).join(id);
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 impl Config {
@@ -166,6 +248,9 @@ impl Config {
     }
 
     /// Loads configuration from a specific path, applying environment overrides.
+    ///
+    /// When the file does not exist the built-in defaults are used, so the bot
+    /// runs without any config file (secrets still come from the environment).
     pub fn load_from(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let mut cfg: Config = if path.exists() {
@@ -173,10 +258,7 @@ impl Config {
                 .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
             toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
         } else {
-            return Err(anyhow::anyhow!(
-                "config file {} not found; copy config.example.toml",
-                path.display()
-            ));
+            Config::default()
         };
         cfg.apply_env_overrides();
         cfg.validate()?;
@@ -185,6 +267,21 @@ impl Config {
 
     /// Overrides secret / deployment fields from the environment.
     pub fn apply_env_overrides(&mut self) {
+        // Secrets first from systemd-supplied credentials, then from the
+        // environment (the latter wins so an explicit override still applies).
+        // systemd places decrypted credentials in $CREDENTIALS_DIRECTORY, one
+        // file per credential id, on a private tmpfs readable only by this
+        // service — strictly more secure than an env file.
+        if let Some(v) = load_credential("private_key") {
+            self.exchange.private_key = v;
+        }
+        if let Some(v) = load_credential("database_url") {
+            self.database.url = v;
+        }
+        if let Some(v) = load_credential("account_address") {
+            self.exchange.account_address = v;
+        }
+
         if let Ok(v) = std::env::var("HYPERBOT_PRIVATE_KEY") {
             if !v.is_empty() {
                 self.exchange.private_key = v;

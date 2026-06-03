@@ -48,8 +48,35 @@ async fn main() -> anyhow::Result<()> {
     .with_cancel_on_exit(config.exchange.cancel_on_exit);
 
     let shutdown = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::error!("failed to listen for ctrl_c: {e}");
+        // Listen for both SIGINT (Ctrl+C) and SIGTERM (the signal `systemd`
+        // sends on `systemctl stop`) so the bot shuts down gracefully under a
+        // service manager as well as in an interactive shell.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("failed to install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => {
+                    if let Err(e) = r {
+                        tracing::error!("failed to listen for ctrl_c: {e}");
+                    }
+                }
+                _ = term.recv() => {
+                    info!("received SIGTERM");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!("failed to listen for ctrl_c: {e}");
+            }
         }
     };
 
