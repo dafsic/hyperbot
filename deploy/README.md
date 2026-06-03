@@ -33,12 +33,11 @@ THIS service. Run as root:
 sudo systemd-creds encrypt --name=private_key - /etc/hyperbot/credentials/private_key.cred
 
 # database url:
-printf 'postgres://hyperbot:password@localhost:5432/hyperbot' \
+printf 'postgres://hyperbot:k32F3k4v4oE5b0qDoh7a@localhost:5432/hyperbot_db' \
   | sudo systemd-creds encrypt --name=database_url - /etc/hyperbot/credentials/database_url.cred
 
 # optional account address (skip if using config.toml / defaults):
-printf '0xYourMainAccount' \
-  | sudo systemd-creds encrypt --name=account_address - /etc/hyperbot/credentials/account_address.cred
+printf '0xYourMainAccount' | sudo systemd-creds encrypt --name=account_address - /etc/hyperbot/credentials/account_address.cred
 
 sudo chmod 600 /etc/hyperbot/credentials/*.cred
 sudo chown root:root /etc/hyperbot/credentials/*.cred

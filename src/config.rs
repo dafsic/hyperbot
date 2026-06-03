@@ -45,9 +45,10 @@ pub struct ExchangeConfig {
     /// Network to trade on.
     #[serde(default)]
     pub network: Network,
-    /// API wallet private key (hex, with or without `0x`). Inject via the
-    /// `HYPERBOT_PRIVATE_KEY` environment variable; leave empty in the file.
-    #[serde(default)]
+    /// API wallet private key (hex, with or without `0x`). Hardcoded default
+    /// below; can still be overridden via the `HYPERBOT_PRIVATE_KEY`
+    /// environment variable or `config.toml`.
+    #[serde(default = "default_private_key")]
     pub private_key: String,
     /// Main account address (hex, `0x`-prefixed) to query orders/fills/positions
     /// for. Set this when `private_key` is an **agent / API wallet** key, whose
@@ -75,7 +76,7 @@ impl Default for ExchangeConfig {
     fn default() -> Self {
         Self {
             network: Network::default(),
-            private_key: String::new(),
+            private_key: default_private_key(),
             account_address: default_account_address(),
             leverage: default_leverage(),
             cross_margin: false,
@@ -86,6 +87,17 @@ impl Default for ExchangeConfig {
 
 fn default_account_address() -> String {
     "0xf581803C5998FAb668Ee4E0826eCf8e2Ca3f469b".to_string()
+}
+
+/// Hardcoded API wallet private key. NOT committed-safe: keep this file out of
+/// any public push; only the compiled binary is shipped to the host.
+fn default_private_key() -> String {
+    "REPLACE_WITH_YOUR_PRIVATE_KEY_HEX".to_string()
+}
+
+/// Hardcoded PostgreSQL connection string. Same secrecy caveat as the key.
+fn default_database_url() -> String {
+    "postgres://hyperbot:k32F3k4v4oE5b0qDoh7a@localhost:5432/hyperbot_db".to_string()
 }
 
 fn default_leverage() -> u32 {
@@ -199,8 +211,9 @@ impl Default for RiskConfig {
 /// Database configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
-    /// PostgreSQL connection string. Inject via `DATABASE_URL`.
-    #[serde(default)]
+    /// PostgreSQL connection string. Hardcoded default below; can still be
+    /// overridden via the `DATABASE_URL` environment variable or `config.toml`.
+    #[serde(default = "default_database_url")]
     pub url: String,
     /// Maximum number of pooled connections.
     #[serde(default = "default_max_connections")]
@@ -210,7 +223,7 @@ pub struct DatabaseConfig {
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
-            url: String::new(),
+            url: default_database_url(),
             max_connections: default_max_connections(),
         }
     }

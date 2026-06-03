@@ -1,9 +1,5 @@
 [Unit]
 Description=Hyperbot grid trading bot
-Documentation=https://github.com/dafsic/hyperbot
-# Wait for network and (if running Postgres on the same host) the database.
-After=network-online.target postgresql.service
-Wants=network-online.target
 
 [Service]
 Type=simple
@@ -16,17 +12,6 @@ WorkingDirectory=/opt/hyperbot
 
 # Absolute path to the release binary.
 ExecStart=/opt/hyperbot/hyperbot
-
-# --- Secrets via systemd encrypted credentials ---
-# Each credential is decrypted at start into $CREDENTIALS_DIRECTORY/<id> on a
-# per-service tmpfs that ONLY this process can read; it is never written to disk
-# in plaintext and is not visible to other users (not even via the unit file).
-# The bot reads these ids: private_key, database_url, account_address.
-# Create them once (see deploy notes) and reference them here:
-LoadCredentialEncrypted=private_key:/etc/hyperbot/credentials/private_key.cred
-LoadCredentialEncrypted=database_url:/etc/hyperbot/credentials/database_url.cred
-# Optional — omit if you keep account_address in config.toml / defaults:
-LoadCredentialEncrypted=account_address:/etc/hyperbot/credentials/account_address.cred
 
 # Log level (override with `systemctl edit hyperbot` if needed).
 Environment=RUST_LOG=info
