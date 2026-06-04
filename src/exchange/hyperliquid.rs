@@ -12,7 +12,7 @@ use hypersdk::hypercore::{self, HttpClient, PerpMarket, PrivateKeySigner};
 use hypersdk::{Address, Decimal};
 use rust_decimal::prelude::ToPrimitive;
 
-use super::{Exchange, FillEvent, OpenOrder, PlaceOrder, PlacedOrder, Position};
+use super::{Exchange, OpenOrder, OrderState, PlaceOrder, PlacedOrder, Position};
 use crate::config::Network;
 use crate::grid::Side;
 
@@ -227,40 +227,27 @@ impl Exchange for HyperliquidExchange {
         Ok(out)
     }
 
-    async fn recent_fills(&self, coin: &str, since_ms: u64) -> anyhow::Result<Vec<FillEvent>> {
-        // Time-windowed query so a long-running bot only pulls fills newer than
-        // the last one it processed, instead of re-fetching the full (capped but
-        // large) history every tick.
-        let fills = self
+    async fn order_status(&self, _coin: &str, oid: u64) -> anyhow::Result<OrderState> {
+        match self
             .client
-            .user_fills_by_time(self.user_address, since_ms, None)
+            .order_status(self.user_address, either::Left(oid))
             .await
-            .map_err(|e| anyhow!("user_fills_by_time: {e}"))?;
-        let raw = fills.len();
-        let mut out = Vec::new();
-        for f in fills {
-            if f.coin != coin {
-                continue;
+            .map_err(|e| anyhow!("order_status: {e}"))?
+        {
+            None => Ok(OrderState::Cancelled),
+            Some(update) => {
+                if update.status.is_filled() {
+                    Ok(OrderState::Filled)
+                } else if update.status.is_finished() {
+                    Ok(OrderState::Cancelled)
+                } else if update.order.sz < update.order.orig_sz {
+                    // Still resting but some quantity was consumed.
+                    Ok(OrderState::PartialFill)
+                } else {
+                    Ok(OrderState::Open)
+                }
             }
-            out.push(FillEvent {
-                oid: f.oid,
-                coin: f.coin.clone(),
-                side: map_side(f.side),
-                price: to_f64(f.px),
-                size: to_f64(f.sz),
-                time: f.time,
-            });
         }
-        tracing::debug!(
-            user = %self.user_address,
-            coin,
-            since_ms,
-            raw,
-            matched = out.len(),
-            oids = ?out.iter().map(|f| f.oid).collect::<Vec<_>>(),
-            "fetched user_fills_by_time"
-        );
-        Ok(out)
     }
 
     async fn position(&self, coin: &str) -> anyhow::Result<Option<Position>> {

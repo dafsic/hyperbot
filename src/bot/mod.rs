@@ -2,12 +2,11 @@
 //! risk manager together into a long-running event loop.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
-use crate::exchange::{Exchange, FillEvent, PlaceOrder};
+use crate::exchange::{Exchange, OrderState, PlaceOrder};
 use crate::grid::{DesiredOrder, GridStrategy, Side};
 use crate::risk::{RiskManager, RiskVerdict};
 use crate::store::{NewGridOrder, OrderStatus, Store};
@@ -22,12 +21,6 @@ pub struct Bot {
     cross_margin: bool,
     /// Whether to cancel all resting orders on graceful shutdown.
     cancel_on_exit: bool,
-    /// Timestamp (ms) of the most recent fill processed, used as a watermark so
-    /// periodic reconciliation only fetches fills newer than the last one seen
-    /// instead of re-scanning the entire (capped but large) fill history each
-    /// tick. Starts at `0` so the first reconcile pulls full history (catching
-    /// fills that happened while the bot was offline).
-    fill_watermark: AtomicU64,
 }
 
 /// Safety cap on how many follow-up orders a single submission may cascade
@@ -54,7 +47,6 @@ impl Bot {
             leverage,
             cross_margin,
             cancel_on_exit: false,
-            fill_watermark: AtomicU64::new(0),
         }
     }
 
@@ -104,14 +96,11 @@ impl Bot {
     /// * **Orphan cancellation** — exchange orders the bot does not track are
     ///   cancelled. This only ever cancels orders that ARE on the book, so it is
     ///   safe even if the book read is partial.
-    /// * **Fill detection** — fills are detected from the exchange's own
-    ///   authoritative fill history ([`Exchange::recent_fills`]), NOT by
-    ///   inferring them from the absence of an order on the book. Inferring from
-    ///   book absence is unsafe: a single incomplete `open_orders` response would
-    ///   make every tracked order look filled and trigger a flood of spurious
-    ///   counter orders. [`Bot::apply_fill`] deduplicates by order status, so a
-    ///   fill already handled (live, immediately, or on a previous tick) is a
-    ///   no-op; only genuinely missed fills get their counter leg seeded.
+    /// * **Fill detection** — the frontier resting order for each side is polled
+    ///   via [`Exchange::order_status`] (at most one API call per resting order
+    ///   per pass, stopping at the first Open). The snapshot of DB orders is
+    ///   taken at the start so newly seeded orders are never polled in the same
+    ///   pass.
     pub async fn reconcile(&self) -> anyhow::Result<Vec<usize>> {
         let coin = self.coin().to_string();
         let db_orders = self.store.open_orders(&coin).await?;
@@ -130,28 +119,97 @@ impl Bot {
             }
         }
 
-        // Authoritatively detect fills from the exchange's fill history and
-        // replay any we missed through the strategy. `apply_fill` dedups by
-        // status, so fills already processed are ignored; counters that cross
-        // the current mid fill immediately and cascade inside `submit_order`.
-        // The query is windowed by `fill_watermark` so each tick only pulls
-        // fills newer than the last one processed, keeping the volume bounded no
-        // matter how long the bot runs. The window is inclusive, so the boundary
-        // fill may reappear; `apply_fill` makes that a no-op.
-        let since = self.fill_watermark.load(Ordering::Relaxed);
-        let fills = self.exchange.recent_fills(&coin, since).await?;
-        if !fills.is_empty() {
-            let mid = self.exchange.mid_price(&coin).await?;
-            let mut max_time = since;
-            for fill in &fills {
-                if let Err(e) = self.apply_fill(fill, mid).await {
-                    error!("failed to apply reconciled fill oid {}: {e}", fill.oid);
+        let mid = self.exchange.mid_price(&coin).await?;
+
+        // Poll frontier sells (lowest-priced first). The invariant is that the
+        // lowest sell fills before higher ones as price rises, so the first Open
+        // order signals that none above it have filled either.
+        let mut sells: Vec<_> = db_orders
+            .iter()
+            .filter(|o| o.side == Side::Sell && o.exchange_oid.is_some())
+            .collect();
+        sells.sort_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for o in &sells {
+            let oid = o.exchange_oid.unwrap() as u64;
+            match self.exchange.order_status(&coin, oid).await? {
+                OrderState::Open => break,
+                OrderState::PartialFill => {
+                    warn!(
+                        oid,
+                        level = o.level,
+                        "sell frontier partially filled; waiting for full fill"
+                    );
+                    break;
                 }
-                max_time = max_time.max(fill.time);
+                OrderState::Cancelled => {
+                    warn!(oid, level = o.level, "sell order cancelled externally");
+                    self.store.set_status(o.id, OrderStatus::Cancelled).await?;
+                }
+                OrderState::Filled => {
+                    info!(level = o.level, side = ?o.side, "frontier sell filled (reconcile)");
+                    self.store
+                        .record_fill(oid, &coin, o.side, o.price, o.size)
+                        .await?;
+                    self.store.set_status(o.id, OrderStatus::Filled).await?;
+                    for counter in self.strategy.on_fill(o.level as usize, o.side) {
+                        if let Err(e) = self.submit_order(counter.clone(), mid).await {
+                            error!(
+                                "failed to submit counter order at level {}: {e}",
+                                counter.level
+                            );
+                        }
+                    }
+                }
             }
-            // Advance the watermark past everything we just saw so the next tick
-            // only asks for newer fills.
-            self.fill_watermark.fetch_max(max_time, Ordering::Relaxed);
+        }
+
+        // Poll frontier buys (highest-priced first). The invariant is that the
+        // highest buy fills before lower ones as price falls.
+        let mut buys: Vec<_> = db_orders
+            .iter()
+            .filter(|o| o.side == Side::Buy && o.exchange_oid.is_some())
+            .collect();
+        buys.sort_by(|a, b| {
+            b.price
+                .partial_cmp(&a.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for o in &buys {
+            let oid = o.exchange_oid.unwrap() as u64;
+            match self.exchange.order_status(&coin, oid).await? {
+                OrderState::Open => break,
+                OrderState::PartialFill => {
+                    warn!(
+                        oid,
+                        level = o.level,
+                        "buy frontier partially filled; waiting for full fill"
+                    );
+                    break;
+                }
+                OrderState::Cancelled => {
+                    warn!(oid, level = o.level, "buy order cancelled externally");
+                    self.store.set_status(o.id, OrderStatus::Cancelled).await?;
+                }
+                OrderState::Filled => {
+                    info!(level = o.level, side = ?o.side, "frontier buy filled (reconcile)");
+                    self.store
+                        .record_fill(oid, &coin, o.side, o.price, o.size)
+                        .await?;
+                    self.store.set_status(o.id, OrderStatus::Filled).await?;
+                    for counter in self.strategy.on_fill(o.level as usize, o.side) {
+                        if let Err(e) = self.submit_order(counter.clone(), mid).await {
+                            error!(
+                                "failed to submit counter order at level {}: {e}",
+                                counter.level
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Levels still resting in the DB, so the caller can avoid double-seeding.
@@ -315,49 +373,6 @@ impl Bot {
         }
     }
 
-    /// Applies a single fill: records it, marks the order filled and seeds the
-    /// strategy's counter order(s), using `reference_price` to decide whether
-    /// each counter rests or crosses.
-    ///
-    /// Idempotent: a fill whose order is already `filled` (handled immediately
-    /// on placement or on a previous reconcile tick) is a no-op, so this is safe
-    /// to call repeatedly from periodic reconciliation with overlapping fills. A
-    /// fill for an order the bot does not track (e.g. unrelated history) is
-    /// ignored.
-    async fn apply_fill(&self, fill: &FillEvent, reference_price: f64) -> anyhow::Result<()> {
-        let order = match self.store.order_by_exchange_oid(fill.oid).await? {
-            Some(o) => o,
-            None => {
-                warn!(
-                    oid = fill.oid,
-                    coin = %fill.coin,
-                    "fill has no matching tracked order; ignoring"
-                );
-                return Ok(());
-            }
-        };
-
-        // Dedup: ignore fills for orders we already closed.
-        if order.status == OrderStatus::Filled.as_str() {
-            return Ok(());
-        }
-
-        self.store
-            .record_fill(fill.oid, &fill.coin, order.side, fill.price, fill.size)
-            .await?;
-        self.store.set_status(order.id, OrderStatus::Filled).await?;
-        info!(level = order.level, side = ?order.side, "order filled");
-
-        for counter in self.strategy.on_fill(order.level as usize, order.side) {
-            if let Err(e) = self.submit_order(counter.clone(), reference_price).await {
-                error!(
-                    "failed to submit counter order at level {}: {e}",
-                    counter.level
-                );
-            }
-        }
-        Ok(())
-    }
     /// Snapshots the current position and evaluates risk limits, returning the
     /// verdict.
     pub async fn check_risk(&self) -> anyhow::Result<RiskVerdict> {
@@ -400,13 +415,13 @@ impl Bot {
         self.bootstrap().await?;
 
         let mut risk_tick = tokio::time::interval(std::time::Duration::from_secs(30));
-        // The bot is poll-only: there is no websocket. Every 20s it reconciles
-        // against the exchange's authoritative fill history (`recent_fills`),
-        // detecting any resting order that filled and seeding its take-profit
-        // counter leg. This is the sole fill-detection path (alongside orders
-        // that fill immediately on placement). The first tick is delayed so it
-        // does not duplicate the reconcile already done in `bootstrap`.
-        let reconcile_period = std::time::Duration::from_secs(20);
+        // The bot is poll-only: there is no websocket. Every 10s it checks the
+        // frontier resting orders (lowest-priced sell and highest-priced buy)
+        // via order_status — at most 2 API calls per tick — detecting any fills
+        // and seeding counter legs. This is the sole fill-detection path alongside
+        // orders that fill immediately on placement. The first tick is delayed so
+        // it does not duplicate the reconcile already done in `bootstrap`.
+        let reconcile_period = std::time::Duration::from_secs(10);
         let mut reconcile_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + reconcile_period,
             reconcile_period,

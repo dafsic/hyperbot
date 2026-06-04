@@ -213,7 +213,7 @@ impl Store {
         Ok(rows.into_iter().map(GridOrderRow::from_row).collect())
     }
 
-    /// Records a fill.
+    /// Records a fill for observability.
     pub async fn record_fill(
         &self,
         exchange_oid: u64,

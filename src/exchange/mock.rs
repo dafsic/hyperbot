@@ -1,11 +1,11 @@
 //! In-memory mock exchange used by unit and integration tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::{Exchange, FillEvent, OpenOrder, PlaceOrder, PlacedOrder, Position};
+use super::{Exchange, OpenOrder, OrderState, PlaceOrder, PlacedOrder, Position};
 use crate::grid::Side;
 
 /// Deterministic, in-memory implementation of [`Exchange`].
@@ -22,11 +22,10 @@ struct Inner {
     orders: HashMap<u64, OpenOrder>,
     position: f64,
     leverage: u32,
-    /// Monotonic clock (ms) stamped on each fill, mirroring the exchange's
-    /// fill timestamps so `recent_fills` can honour a `since_ms` window.
-    clock: u64,
-    /// Authoritative log of every fill, mirroring the exchange's `user_fills`.
-    fills: Vec<FillEvent>,
+    /// Oids that filled completely.
+    filled_oids: HashSet<u64>,
+    /// Oids that are still resting but have had at least one partial fill.
+    partial_oids: HashSet<u64>,
 }
 
 impl MockExchange {
@@ -39,8 +38,8 @@ impl MockExchange {
                 orders: HashMap::new(),
                 position: 0.0,
                 leverage: 1,
-                clock: 1,
-                fills: Vec::new(),
+                filled_oids: HashSet::new(),
+                partial_oids: HashSet::new(),
             }),
         }
     }
@@ -68,9 +67,9 @@ impl MockExchange {
         self.inner.lock().unwrap().leverage
     }
 
-    /// Simulates a fill of a resting order, updating the position and appending
-    /// the fill to the authoritative fill log. Returns the fill event.
-    pub fn fill(&self, oid: u64) -> Option<FillEvent> {
+    /// Simulates an external fill of a resting order, updating the position.
+    /// Returns `None` if `oid` is not currently resting.
+    pub fn fill(&self, oid: u64) -> Option<()> {
         let mut inner = self.inner.lock().unwrap();
         let order = inner.orders.remove(&oid)?;
         let signed = match order.side {
@@ -78,18 +77,28 @@ impl MockExchange {
             Side::Sell => -order.size,
         };
         inner.position += signed;
-        let time = inner.clock;
-        inner.clock += 1;
-        let event = FillEvent {
-            oid,
-            coin: order.coin.clone(),
-            side: order.side,
-            price: order.price,
-            size: order.size,
-            time,
+        inner.partial_oids.remove(&oid);
+        inner.filled_oids.insert(oid);
+        Some(())
+    }
+
+    /// Simulates a partial fill of a resting order, reducing its remaining
+    /// size by `qty` and updating the position. Returns `None` if `oid` is
+    /// not currently resting.
+    pub fn partial_fill(&self, oid: u64, qty: f64) -> Option<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // Destructure to avoid overlapping mutable borrows.
+        let order = inner.orders.get(&oid)?;
+        let side = order.side;
+        let remaining = order.size - qty;
+        let signed = match side {
+            Side::Buy => qty,
+            Side::Sell => -qty,
         };
-        inner.fills.push(event.clone());
-        Some(event)
+        inner.position += signed;
+        inner.orders.get_mut(&oid).unwrap().size = remaining;
+        inner.partial_oids.insert(oid);
+        Some(())
     }
 
     /// Sets a new mid price.
@@ -132,16 +141,7 @@ impl Exchange for MockExchange {
                 Side::Sell => -req.size,
             };
             inner.position += signed;
-            let time = inner.clock;
-            inner.clock += 1;
-            inner.fills.push(FillEvent {
-                oid,
-                coin: req.coin.clone(),
-                side: req.side,
-                price: req.price,
-                size: req.size,
-                time,
-            });
+            inner.filled_oids.insert(oid);
             return Ok(PlacedOrder {
                 oid,
                 resting: false,
@@ -177,14 +177,19 @@ impl Exchange for MockExchange {
         Ok(v)
     }
 
-    async fn recent_fills(&self, coin: &str, since_ms: u64) -> anyhow::Result<Vec<FillEvent>> {
+    async fn order_status(&self, _coin: &str, oid: u64) -> anyhow::Result<OrderState> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .fills
-            .iter()
-            .filter(|f| f.coin == coin && f.time >= since_ms)
-            .cloned()
-            .collect())
+        if inner.orders.contains_key(&oid) {
+            if inner.partial_oids.contains(&oid) {
+                Ok(OrderState::PartialFill)
+            } else {
+                Ok(OrderState::Open)
+            }
+        } else if inner.filled_oids.contains(&oid) {
+            Ok(OrderState::Filled)
+        } else {
+            Ok(OrderState::Cancelled)
+        }
     }
 
     async fn position(&self, coin: &str) -> anyhow::Result<Option<Position>> {
@@ -219,8 +224,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ex.open_count(), 1);
-        let fill = ex.fill(placed.oid).unwrap();
-        assert_eq!(fill.side, Side::Sell);
+        ex.fill(placed.oid).unwrap();
         assert_eq!(ex.open_count(), 0);
         assert_eq!(ex.net_position(), -1.0);
     }

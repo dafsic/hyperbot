@@ -67,22 +67,18 @@ pub struct Position {
     pub unrealized_pnl: f64,
 }
 
-/// A fill reported by the exchange's own fill history.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FillEvent {
-    /// Exchange order id that was filled.
-    pub oid: u64,
-    /// Coin symbol.
-    pub coin: String,
-    /// Side of the fill.
-    pub side: Side,
-    /// Fill price.
-    pub price: f64,
-    /// Fill size.
-    pub size: f64,
-    /// Fill timestamp in milliseconds since the Unix epoch. Used as a watermark
-    /// so periodic polling only fetches fills newer than the last one seen.
-    pub time: u64,
+/// The lifecycle state of an order as reported by the exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderState {
+    /// Still resting on the order book with no fills yet.
+    Open,
+    /// Resting on the order book but part of the quantity has already been
+    /// filled (remaining size < original size).
+    PartialFill,
+    /// Fully filled.
+    Filled,
+    /// Cancelled or unknown oid.
+    Cancelled,
 }
 
 /// Abstraction over a trading venue.
@@ -103,23 +99,12 @@ pub trait Exchange: Send + Sync {
     /// Lists currently open orders for `coin`.
     async fn open_orders(&self, coin: &str) -> anyhow::Result<Vec<OpenOrder>>;
 
-    /// Returns fills for `coin` from the exchange's own fill history, limited to
-    /// those at or after `since_ms` (milliseconds since the Unix epoch).
+    /// Returns the lifecycle state of a specific order by its exchange-assigned oid.
     ///
-    /// This is the **authoritative** source of fills. The bot detects filled
-    /// orders by periodically polling this history and matching fills back to
-    /// tracked orders by `oid`. Unlike inferring fills from the absence of an
-    /// order on the book (which is unsafe when a book snapshot is incomplete), a
-    /// fill reported here definitely happened.
-    ///
-    /// `since_ms` bounds the volume so a long-running bot does not re-fetch and
-    /// re-scan its entire (capped, but still large) fill history every tick:
-    /// callers pass the timestamp of the last fill they processed. The window is
-    /// **inclusive** of `since_ms`, so the boundary fill may be returned again;
-    /// callers must deduplicate (which the bot already does by order status).
-    /// Pass `0` to fetch the full available history (e.g. on startup, to catch
-    /// fills that happened while the bot was offline).
-    async fn recent_fills(&self, coin: &str, since_ms: u64) -> anyhow::Result<Vec<FillEvent>>;
+    /// Used by periodic reconciliation to check whether frontier resting orders
+    /// have filled or been cancelled externally. Returns [`OrderState::Cancelled`]
+    /// for an unknown oid so the caller can stop tracking it safely.
+    async fn order_status(&self, coin: &str, oid: u64) -> anyhow::Result<OrderState>;
 
     /// Returns the current position for `coin`, if any.
     async fn position(&self, coin: &str) -> anyhow::Result<Option<Position>>;

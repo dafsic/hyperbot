@@ -2800,6 +2800,7 @@ dependencies = [
  "approx",
  "async-trait",
  "chrono",
+ "either",
  "hypersdk",
  "rust_decimal",
  "serde",
@@ -2816,8 +2817,6 @@ dependencies = [
 [[package]]
 name = "hypersdk"
 version = "0.2.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72af569672779569a6a7d2d1566c8516905e31e012b16aa4cdddbf2462dbcbf5"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2835,6 +2834,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "url",

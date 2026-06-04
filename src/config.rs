@@ -149,11 +149,11 @@ fn default_coin() -> String {
 }
 
 fn default_lower_price() -> f64 {
-    340.0
+    350.0
 }
 
 fn default_upper_price() -> f64 {
-    360.0
+    370.0
 }
 
 fn default_grid_count() -> usize {
@@ -161,7 +161,7 @@ fn default_grid_count() -> usize {
 }
 
 fn default_order_size() -> f64 {
-    0.1
+    0.2
 }
 
 impl GridConfig {
@@ -399,13 +399,14 @@ max_connections = 5
     }
 
     #[test]
-    fn validation_requires_secrets() {
+    fn hardcoded_defaults_pass_validation() {
         let _guard = ENV_LOCK.lock().unwrap();
+        // Secrets are compiled in as defaults; loading a config file that does
+        // not set private_key / database.url must still succeed.
         let f = write_tmp(SAMPLE);
         std::env::remove_var("HYPERBOT_PRIVATE_KEY");
         std::env::remove_var("DATABASE_URL");
-        // No secrets provided -> validation fails.
-        assert!(Config::load_from(f.path()).is_err());
+        assert!(Config::load_from(f.path()).is_ok());
     }
 
     #[test]
