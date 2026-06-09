@@ -8,7 +8,6 @@ use tracing::{error, info, warn};
 
 use crate::exchange::{Exchange, OrderState, PlaceOrder};
 use crate::grid::{DesiredOrder, GridStrategy, Side};
-use crate::risk::{RiskManager, RiskVerdict};
 use crate::store::{NewGridOrder, OrderStatus, Store};
 
 /// The grid bot.
@@ -16,7 +15,6 @@ pub struct Bot {
     exchange: Arc<dyn Exchange>,
     store: Store,
     strategy: GridStrategy,
-    risk: RiskManager,
     leverage: u32,
     cross_margin: bool,
     /// Whether to cancel all resting orders on graceful shutdown.
@@ -35,7 +33,6 @@ impl Bot {
         exchange: Arc<dyn Exchange>,
         store: Store,
         strategy: GridStrategy,
-        risk: RiskManager,
         leverage: u32,
         cross_margin: bool,
     ) -> Self {
@@ -43,7 +40,6 @@ impl Bot {
             exchange,
             store,
             strategy,
-            risk,
             leverage,
             cross_margin,
             cancel_on_exit: false,
@@ -373,25 +369,6 @@ impl Bot {
         }
     }
 
-    /// Snapshots the current position and evaluates risk limits, returning the
-    /// verdict.
-    pub async fn check_risk(&self) -> anyhow::Result<RiskVerdict> {
-        let coin = self.coin().to_string();
-        let position = self.exchange.position(&coin).await?;
-        let (size, pnl) = match &position {
-            Some(p) => (p.size, p.unrealized_pnl),
-            None => (0.0, 0.0),
-        };
-        if let Some(p) = &position {
-            let _ = self.store.snapshot_position(p).await;
-        }
-        let verdict = self.risk.evaluate(size, pnl);
-        if let RiskVerdict::Breached(reason) = &verdict {
-            warn!("risk limit breached: {reason}");
-        }
-        Ok(verdict)
-    }
-
     /// Cancels every order the bot currently tracks as open.
     pub async fn cancel_all(&self) -> anyhow::Result<()> {
         let coin = self.coin().to_string();
@@ -414,7 +391,6 @@ impl Bot {
     {
         self.bootstrap().await?;
 
-        let mut risk_tick = tokio::time::interval(std::time::Duration::from_secs(30));
         // The bot is poll-only: there is no websocket. Every 10s it checks the
         // frontier resting orders (lowest-priced sell and highest-priced buy)
         // via order_status — at most 2 API calls per tick — detecting any fills
@@ -433,17 +409,6 @@ impl Bot {
                 _ = &mut shutdown => {
                     info!("shutdown requested");
                     break;
-                }
-                _ = risk_tick.tick() => {
-                    match self.check_risk().await {
-                        Ok(RiskVerdict::Breached(reason)) => {
-                            error!("tripping circuit breaker: {reason}");
-                            let _ = self.cancel_all().await;
-                            break;
-                        }
-                        Ok(RiskVerdict::Ok) => {}
-                        Err(e) => error!("risk check failed: {e}"),
-                    }
                 }
                 _ = reconcile_tick.tick() => {
                     if let Err(e) = self.reconcile().await {

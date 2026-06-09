@@ -6,7 +6,6 @@ use hyperbot::bot::Bot;
 use hyperbot::config::Config;
 use hyperbot::exchange::{Exchange, HyperliquidExchange};
 use hyperbot::grid::GridStrategy;
-use hyperbot::risk::RiskManager;
 use hyperbot::store::Store;
 use hyperbot::telemetry;
 use tracing::info;
@@ -25,7 +24,6 @@ async fn main() -> anyhow::Result<()> {
 
     let strategy = GridStrategy::new(config.grid.to_params())
         .map_err(|e| anyhow::anyhow!("invalid grid: {e}"))?;
-    let risk = RiskManager::new(config.risk.clone());
 
     let store = Store::connect(&config.database.url, config.database.max_connections).await?;
 
@@ -41,7 +39,6 @@ async fn main() -> anyhow::Result<()> {
         exchange,
         store,
         strategy,
-        risk,
         config.exchange.leverage,
         config.exchange.cross_margin,
     )

@@ -7,10 +7,8 @@
 use std::sync::Arc;
 
 use hyperbot::bot::Bot;
-use hyperbot::config::RiskConfig;
 use hyperbot::exchange::{Exchange, MockExchange};
 use hyperbot::grid::{GridMode, GridParams, GridStrategy, Side, Spacing};
-use hyperbot::risk::RiskManager;
 use hyperbot::store::Store;
 use sqlx::postgres::PgPoolOptions;
 
@@ -33,14 +31,7 @@ fn make_bot(exchange: Arc<dyn Exchange>, store: Store) -> Bot {
 }
 
 fn make_bot_with(exchange: Arc<dyn Exchange>, store: Store, mode: GridMode) -> Bot {
-    Bot::new(
-        exchange,
-        store,
-        strategy_with(mode),
-        RiskManager::new(RiskConfig::default()),
-        1,
-        false,
-    )
+    Bot::new(exchange, store, strategy_with(mode), 1, false)
 }
 
 async fn make_store(url: &str) -> Store {
